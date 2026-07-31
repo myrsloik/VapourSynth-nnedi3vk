@@ -1,0 +1,24 @@
+#version 460
+// nnedi3vk row copy kernel: moves the kept field's rows from the source plane
+// into their output positions, replacing what used to be a CPU bitblt (and
+// briefly, thousands of per-row transfer regions — copy engines hate those).
+// Byte addressed so one compiled variant covers every pixel type; the push
+// constants are therefore in BYTES for this kernel: source row r lives at
+// rowOff + rowScale * r, the output row at dstBase + dstPitch * r, and width
+// is the row length.
+//
+// Bindings reuse the common.glsl declarations positionally: binding 0
+// ("padBuf") is the source plane, binding 1 ("dstBuf") the destination plane.
+
+#include "common.glsl"
+
+layout(local_size_x = 64, local_size_y = 4) in;
+
+void main() {
+    const int x = int(gl_GlobalInvocationID.x);
+    const int r = int(gl_GlobalInvocationID.y);
+    if (x >= pc.width || r >= pc.rows)
+        return;
+
+    dstBuf[pc.dstBase + pc.dstPitch * r + x] = padBuf[pc.rowOff + pc.rowScale * r + x];
+}

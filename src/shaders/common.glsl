@@ -48,6 +48,12 @@ layout(push_constant, scalar) uniform PC {
     int rows;      // interpolated rows (= field height)
     int padStride; // padded plane stride in elements
     int peak;      // integer clamp ceiling (255 / 65535)
+    int srcStride; // pad/rowcopy: source plane stride in elements
+    int rowOff;    // pad/rowcopy: field row f maps to source row rowOff + rowScale * f
+    int rowScale;
+    int fp;        // pad kernel only: znedi3 PadFilter parity (= !field parity)
+    int dstBase;   // output element index of interpolated (or copied) row 0
+    int dstPitch;  // output elements between consecutive interpolated rows
 } pc;
 
 // Padded source plane: (rows + 2*MARGIN_V) x padStride in the native pixel
@@ -71,6 +77,16 @@ pix_t storePix(float v) {
 #else
     return pix_t(v);
 #endif
+}
+
+// The output binding is the destination plane itself; interpolated pixel
+// idx = r * width + x lands at output row dstBase + r * dstPitch, so the
+// kernels write their strided half of the frame directly with no packed
+// intermediate or copy pass.
+void storeDst(uint idx, float v) {
+    const int r = int(idx) / pc.width;
+    const int x = int(idx) % pc.width;
+    dstBuf[pc.dstBase + r * pc.dstPitch + x] = storePix(v);
 }
 
 float elliott(float x) {

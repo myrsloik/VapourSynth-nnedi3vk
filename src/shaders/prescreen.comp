@@ -153,7 +153,7 @@ void main() {
             if ((needMask & (1u << n)) != 0u)
                 pixIdx[cnt++] = idx;
             else
-                dstBuf[idx] = storePix(cubic(r, x + MARGIN_H));
+                storeDst(idx, cubic(r, x + MARGIN_H));
         }
     }
 

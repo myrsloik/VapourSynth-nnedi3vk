@@ -1,0 +1,34 @@
+#version 460
+// nnedi3vk pad kernel.
+//
+// Builds the padded field plane the prescreen/predict kernels read, on the
+// GPU, straight from the resident source plane — the replacement for the
+// copyPadPlane CPU loop from the pre-GPU-node versions of this plugin. Padded
+// row i corresponds to source field row clamp(i - (MARGIN_V - fp), 0,
+// rows - 1) (znedi3's PadFilter geometry); field row f lives at source plane
+// row rowOff + rowScale * f (rowScale 2 selects a field of an interleaved
+// frame, 1 takes every row when dh=True). Horizontal margins, and the
+// alignment slack out to padStride, replicate the edge pixels exactly like
+// the CPU code did.
+//
+// Bindings reuse the common.glsl declarations positionally: binding 0
+// ("padBuf") is the source plane here, binding 1 ("dstBuf") the padded
+// output.
+
+#include "common.glsl"
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+void main() {
+    const int x = int(gl_GlobalInvocationID.x);
+    const int y = int(gl_GlobalInvocationID.y);
+    const int padH = pc.rows + MARGIN_V * 2;
+    if (x >= pc.padStride || y >= padH)
+        return;
+
+    const int sx = clamp(x - MARGIN_H, 0, pc.width - 1);
+    const int f = clamp(y - (MARGIN_V - pc.fp), 0, pc.rows - 1);
+    const int srcRow = pc.rowOff + pc.rowScale * f;
+
+    dstBuf[y * pc.padStride + x] = padBuf[srcRow * pc.srcStride + sx];
+}

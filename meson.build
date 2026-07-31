@@ -3,13 +3,11 @@ project('nnedi3vk', 'cpp',
     license: 'GPL-3.0-or-later',
     license_files: 'LICENSE',
     meson_version: '>=1.2.3',
-    version: '1.0',
+    version: '2.0',
 )
 
 deps = [
     dependency('vulkan-headers'),
-    dependency('vulkan-memory-allocator'),
-    dependency('vulkan-volk'),
 ]
 
 glslc = find_program('glslc')
@@ -20,7 +18,7 @@ py = import('python').find_installation(pure: false)
 
 shaders = []
 
-foreach kernel : ['prescreen', 'predict', 'predict_cv']
+foreach kernel : ['pad', 'prescreen', 'predict']
     foreach pixel : [['u8', '0'], ['u16', '1'], ['f16', '2'], ['f32', '3']]
         shaders += custom_target(
             command: [
@@ -39,6 +37,23 @@ foreach kernel : ['prescreen', 'predict', 'predict_cv']
         )
     endforeach
 endforeach
+
+# Byte addressed, one variant covers every pixel type.
+shaders += custom_target(
+    command: [
+        glslc,
+        '-DPIXEL_TYPE=0',
+        '-mfmt=num',
+        '-O',
+        '--target-env=vulkan1.4',
+        '-o',
+        '@OUTPUT@',
+        '@INPUT@',
+    ],
+    depend_files: files('src/shaders/common.glsl'),
+    input: files('src/shaders/rowcopy.comp'),
+    output: 'rowcopy.h',
+)
 
 shared_module('nnedi3vk',
     files('src/nnedi3vk.cpp'),

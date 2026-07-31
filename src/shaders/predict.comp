@@ -296,6 +296,6 @@ void main() {
         [[unroll]] for (int px = 0; px < PX; px++) {
             if (px >= npx)
                 break;
-            dstBuf[idxs[px]] = storePix(result[px] / float(QUAL));
+            storeDst(idxs[px], result[px] / float(QUAL));
         }
 }
