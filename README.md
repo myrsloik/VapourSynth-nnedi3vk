@@ -2,16 +2,18 @@
 
 NNEDI3 is an intra-field only deinterlacer. It takes in a frame, throws away one field, and then interpolates the missing pixels using only information from the kept field. It has same rate and double rate modes. NNEDI3 is also very good for enlarging images by powers of 2.
 
+Runs on the VapourSynth core's Vulkan device: frames go in and come out GPU resident (`vnode:gpu`), so chains of GPU filters never leave VRAM. Feeding a CPU clip automatically inserts an upload, and `std.GPUDownload` brings the result back when the chain ends. The device is selected core-wide with `core.set_vulkan_device(index)` (see `core.vulkan_devices`) before first use.
+
 
 ## Requirement
 
-A Vulkan 1.4 capable GPU and driver.
+VapourSynth R73+ with GPU support (API 4.3), and a Vulkan 1.4 capable GPU and driver.
 
 
 ## Usage
 
 ```py
-nnedi3vk.NNEDI3(vnode clip, int field[, bint dh=False, int[] planes=[0, 1, 2], int nsize=6, int nns=1, int qual=1, int etype=0, int pscrn=2, bint coopvec=True, int device_index=0, bint list_device=False, int num_streams=2])
+nnedi3vk.NNEDI3(vnode:gpu clip, int field[, bint dh=False, int[] planes=[0, 1, 2], int nsize=6, int nns=1, int qual=1, int etype=0, int pscrn=2, int num_streams=2])
 ```
 
 - clip: Clip to process. Any format with either 8-16 bit integer or 16/32 bit float is supported.
@@ -55,13 +57,9 @@ nnedi3vk.NNEDI3(vnode clip, int field[, bint dh=False, int[] planes=[0, 1, 2], i
   - 3 = new prescreener level 1
   - 4 = new prescreener level 2
 
-- coopvec: Runs the predictor neural network with FP16 tensor cores instead of FP32 subgroup GEMV. Requires `VK_NV_cooperative_vector` and hence NVIDIA only.
+- num_streams: Number of frames the filter keeps in flight on the GPU at once.
 
-- device_index: Index of the Vulkan device to use.
-
-- list_device: If True, raises an error listing the available Vulkan devices and their indices.
-
-- num_streams: Number of streams to run kernels in parallel on the Vulkan device.
+Removed relative to the standalone (pre-GPU-node) versions: `device_index` and `list_device` (device selection is core-wide now) and `coopvec` (the core device enables no vendor extensions; the FP32 subgroup GEMV path is used on all hardware).
 
 
 ## Installation
