@@ -48,7 +48,7 @@ shared_module('nnedi3vk',
     include_directories: incdir,
     install: true,
     install_dir: py.get_install_dir() / 'vapoursynth/plugins/nnedi3vk',
-    install_rpath: '/opt/homebrew/lib;/usr/local/lib',
+    install_rpath: '/opt/homebrew/lib:/usr/local/lib',
     name_prefix: '',
 )
 
