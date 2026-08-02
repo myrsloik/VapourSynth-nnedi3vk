@@ -403,23 +403,6 @@ struct PlaneSetup {
     VkDeviceSize cntOffset = 0;                 // device scratch buffer, 16 bytes
 };
 
-// One in-flight recording: command pool/buffer plus the scratch its
-// submission reads and writes. Reuse waits out the previous submission, so
-// num_streams bounds how many frames this instance keeps in flight.
-struct StreamCtx {
-    VkCommandPool pool = VK_NULL_HANDLE;
-    VkCommandBuffer cmd = VK_NULL_HANDLE;
-    VSGPUBuffer* padBuf = nullptr;
-    VSVulkanBufferInfo padInfo{};
-    VSGPUBuffer* devBuf = nullptr;
-    VSVulkanBufferInfo devInfo{};
-    uint64_t lastValue = 0;
-    VkQueryPool queryPool = VK_NULL_HANDLE; // profiling only
-    bool profilePending = false;
-};
-
-constexpr int MAX_RETAINED = 64;
-
 struct NNEDI3Data {
     VSNode* node = nullptr;
     VSVideoInfo vi{};
@@ -456,87 +439,25 @@ struct NNEDI3Data {
     uint32_t prescreenWG = 128;      // prescreen workgroup size (threads)
     uint32_t pixelsPerPredictWG = 4; // predict: pixels per workgroup
 
-    // The filter's own timeline: it signals rising values and publishes them
-    // as the producer pairs of the frames it writes, so it must outlive every
-    // consumer — it lives and dies with the filter instance. Values are
-    // allocated under the core's compute queue lock.
-    VkSemaphore timeline = VK_NULL_HANDLE;
-    uint64_t nextValue = 0;
-
-    std::vector<std::unique_ptr<StreamCtx>> streams;
-    std::mutex streamMutex;
-    std::condition_variable streamCv;
-    std::vector<int> freeStreams;
-
-    // Source frames held until the submission reading them completes, swept
-    // non-blockingly with the counter query. Guarded by streamMutex.
-    struct { const VSFrame* frame; uint64_t value; } retained[MAX_RETAINED];
-    int retainedCount = 0;
+    // The core's exec pool owns the timeline, the command buffers and the in
+    // flight bound (num_streams contexts), and it keeps source frames and
+    // scratch alive until the submissions using them complete.
+    VSGPUExecPool* execPool = nullptr;
 
     bool profile = false;
     std::mutex profileMutex;
     double prescreenMs = 0.0, predictMs = 0.0, copyMs = 0.0;
     int64_t profiledFrames = 0;
 
-    void waitValue(uint64_t value) const {
-        const VkSemaphoreWaitInfo wi{ .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
-                                      .semaphoreCount = 1,
-                                      .pSemaphores = &timeline,
-                                      .pValues = &value };
-        VK_CHECK(vk->vkWaitSemaphores(h.device, &wi, UINT64_MAX));
-    }
-
-    // Reads a stream's finished timestamps into the profile accumulators;
-    // call only when its lastValue is known complete.
-    void collectProfile(StreamCtx& s) {
-        if (!s.profilePending)
-            return;
-        s.profilePending = false;
-        uint64_t ts[4] = {};
-        if (vk->vkGetQueryPoolResults(h.device, s.queryPool, 0, 4, sizeof(ts), ts, sizeof(uint64_t),
-                                      VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
-            const double period = timestampPeriod * 1e-6; // ns -> ms
-            std::lock_guard<std::mutex> lock(profileMutex);
-            prescreenMs += (ts[1] - ts[0]) * period;
-            predictMs += (ts[2] - ts[1]) * period;
-            copyMs += (ts[3] - ts[2]) * period;
-            profiledFrames++;
-        }
-    }
-
-    void sweepRetained(const VSAPI* vsapi) {
-        uint64_t completed = 0;
-        if (vk->vkGetSemaphoreCounterValue(h.device, timeline, &completed) != VK_SUCCESS)
-            return;
-        int kept = 0;
-        for (int i = 0; i < retainedCount; i++) {
-            if (retained[i].value <= completed)
-                vsapi->freeFrame(retained[i].frame);
-            else
-                retained[kept++] = retained[i];
-        }
-        retainedCount = kept;
-    }
-
     void destroy(const VSAPI* vsapi) {
         if (!vk)
             return;
         const VkDevice device = h.device;
-        if (timeline && nextValue)
-            waitValue(nextValue);
-        sweepRetained(vsapi);
-        for (auto& s : streams) {
-            collectProfile(*s);
-            if (s->queryPool)
-                vk->vkDestroyQueryPool(device, s->queryPool, nullptr);
-            if (s->pool)
-                vk->vkDestroyCommandPool(device, s->pool, nullptr);
-            if (s->padBuf)
-                vkapi->destroyGPUBuffer(s->padBuf);
-            if (s->devBuf)
-                vkapi->destroyGPUBuffer(s->devBuf);
-        }
-        streams.clear();
+        // Drains the GPU and releases every frame and scratch buffer still
+        // held by an unfinished submission.
+        if (execPool)
+            vkapi->freeGPUExecPool(execPool);
+        execPool = nullptr;
         if (padPipe)
             vk->vkDestroyPipeline(device, padPipe, nullptr);
         if (rowcopyPipe)
@@ -557,8 +478,6 @@ struct NNEDI3Data {
             vk->vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
         if (dsl)
             vk->vkDestroyDescriptorSetLayout(device, dsl, nullptr);
-        if (timeline)
-            vk->vkDestroySemaphore(device, timeline, nullptr);
         if (weightsBuf)
             vkapi->destroyGPUBuffer(weightsBuf);
 
@@ -646,45 +565,36 @@ const VSFrame* VS_CC nnedi3GetFrame(int n, int activationReason, void* instanceD
     const int fp = !parity; // znedi3 PadFilter parity
     const int bps = d->vi.format.bytesPerSample;
 
-    // Acquire a stream; reuse waits out its previous submission, which is the
-    // in-flight bound of this instance.
-    int streamIdx;
-    {
-        std::unique_lock<std::mutex> lock(d->streamMutex);
-        d->streamCv.wait(lock, [&] { return !d->freeStreams.empty(); });
-        streamIdx = d->freeStreams.back();
-        d->freeStreams.pop_back();
-        d->sweepRetained(vsapi);
+    // Claim a recording slot; the pool waits out the oldest submission, which
+    // is this instance's in flight bound.
+    char verr[512] = { 0 };
+    VSGPUExecContext* ctx = d->vkapi->gpuExecAcquire(d->execPool, verr, sizeof(verr));
+    if (!ctx) {
+        vsapi->setFilterError(("NNEDI3VK: "s + verr).c_str(), frameCtx);
+        vsapi->freeFrame(src);
+        vsapi->freeFrame(dst);
+        return nullptr;
     }
-    StreamCtx& s = *d->streams[streamIdx];
-
-    auto releaseStream = [&] {
-        if (streamIdx < 0)
-            return;
-        {
-            std::lock_guard<std::mutex> lock(d->streamMutex);
-            d->freeStreams.push_back(streamIdx);
-        }
-        d->streamCv.notify_one();
-        streamIdx = -1;
-    };
+    const VkCommandBuffer cmd = d->vkapi->gpuExecCommandBuffer(ctx);
+    VSVulkanBufferInfo padInfo{}, devInfo{};
 
     try {
-        if (s.lastValue)
-            d->waitValue(s.lastValue);
-        d->collectProfile(s);
+        // Per frame scratch out of the core's pooled allocator: the exec pool
+        // destroys both once this submission completes, so the recycled block
+        // is back in the bucket by the next frame.
+        VSGPUBuffer* padBuf = d->vkapi->createGPUBuffer(core, d->padSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, &padInfo, verr, sizeof(verr));
+        if (!padBuf)
+            throw std::runtime_error("pad scratch buffer: "s + verr);
+        d->vkapi->gpuExecUsesBuffer(ctx, padBuf);
 
-        const VkDevice device = d->h.device;
-        VK_CHECK(d->vk->vkResetCommandPool(device, s.pool, 0));
-        if (d->profile)
-            d->vk->vkResetQueryPool(device, s.queryPool, 0, 4);
-
-        const VkCommandBufferBeginInfo bi{ .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-                                           .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
-        VK_CHECK(d->vk->vkBeginCommandBuffer(s.cmd, &bi));
-
-        if (d->profile)
-            d->vk->vkCmdWriteTimestamp2(s.cmd, VK_PIPELINE_STAGE_2_NONE, s.queryPool, 0);
+        VSGPUBuffer* devBuf = d->vkapi->createGPUBuffer(core, d->devbufSize,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, &devInfo, verr, sizeof(verr));
+        if (!devBuf)
+            throw std::runtime_error("device scratch buffer: "s + verr);
+        d->vkapi->gpuExecUsesBuffer(ctx, devBuf);
 
         const int numPlanes = d->vi.format.numPlanes;
 
@@ -703,7 +613,7 @@ const VSFrame* VS_CC nnedi3GetFrame(int n, int activationReason, void* instanceD
                                           .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
                                           .size = sizeof(pcv),
                                           .pValues = &pcv };
-            d->vk->vkCmdPushConstants2(s.cmd, &pi);
+            d->vk->vkCmdPushConstants2(cmd, &pi);
         };
 
         auto pushDescriptors = [&](const VkDescriptorBufferInfo* bufs, uint32_t count) {
@@ -714,13 +624,13 @@ const VSFrame* VS_CC nnedi3GetFrame(int n, int activationReason, void* instanceD
                                                   .descriptorCount = 1,
                                                   .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                                                   .pBufferInfo = &bufs[i] };
-            d->vk->vkCmdPushDescriptorSet(s.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d->pipelineLayout, 0, count, writes);
+            d->vk->vkCmdPushDescriptorSet(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d->pipelineLayout, 0, count, writes);
         };
 
         // Pass-through rows: the source field's rows land unchanged at output
         // rows parity + 2r (or every source row when dh). Byte addressed, so
         // every push constant of the rowcopy kernel is in bytes.
-        d->vk->vkCmdBindPipeline(s.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d->rowcopyPipe);
+        d->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d->rowcopyPipe);
         for (int plane = 0; plane < numPlanes; plane++) {
             const PlaneSetup& p = d->planes[plane];
             if (!p.process)
@@ -743,19 +653,19 @@ const VSFrame* VS_CC nnedi3GetFrame(int n, int activationReason, void* instanceD
                                   .fp = 0,
                                   .dstBase = parity * dstStride,
                                   .dstPitch = dstStride * 2 });
-            d->vk->vkCmdDispatch(s.cmd, (static_cast<uint32_t>(rowBytes) + 63) / 64,
+            d->vk->vkCmdDispatch(cmd, (static_cast<uint32_t>(rowBytes) + 63) / 64,
                                  (static_cast<uint32_t>(p.rows) + 3) / 4, 1);
         }
 
         // Pad: source plane -> padded field plane in the pad scratch.
-        d->vk->vkCmdBindPipeline(s.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d->padPipe);
+        d->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d->padPipe);
         for (int plane = 0; plane < numPlanes; plane++) {
             const PlaneSetup& p = d->planes[plane];
             if (!p.process)
                 continue;
             const VkDescriptorBufferInfo bufs[2] = {
                 { srcPlanes[plane].buffer, 0, VK_WHOLE_SIZE },
-                { s.padInfo.buffer, p.padOffset, p.padBytes },
+                { padInfo.buffer, p.padOffset, p.padBytes },
             };
             pushDescriptors(bufs, 2);
             pushPC(PushConstants{ .width = p.width,
@@ -768,7 +678,7 @@ const VSFrame* VS_CC nnedi3GetFrame(int n, int activationReason, void* instanceD
                                   .fp = fp,
                                   .dstBase = 0,
                                   .dstPitch = 0 });
-            d->vk->vkCmdDispatch(s.cmd, (static_cast<uint32_t>(p.padStride) + 15) / 16,
+            d->vk->vkCmdDispatch(cmd, (static_cast<uint32_t>(p.padStride) + 15) / 16,
                                  (static_cast<uint32_t>(p.padHeight) + 15) / 16, 1);
         }
 
@@ -778,13 +688,13 @@ const VSFrame* VS_CC nnedi3GetFrame(int n, int activationReason, void* instanceD
                 const PlaneSetup& p = d->planes[plane];
                 if (!p.process)
                     continue;
-                d->vk->vkCmdFillBuffer(s.cmd, s.devInfo.buffer, p.cntOffset, 8, 0);     // predCount, groupsX
-                d->vk->vkCmdFillBuffer(s.cmd, s.devInfo.buffer, p.cntOffset + 8, 8, 1); // groupsY, groupsZ
+                d->vk->vkCmdFillBuffer(cmd, devInfo.buffer, p.cntOffset, 8, 0);     // predCount, groupsX
+                d->vk->vkCmdFillBuffer(cmd, devInfo.buffer, p.cntOffset + 8, 8, 1); // groupsY, groupsZ
             }
         }
 
         // Pad writes and counter fills become visible to the network kernels.
-        cmdMemoryBarrier(d->vk, s.cmd,
+        cmdMemoryBarrier(d->vk, cmd,
                          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT,
                          VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
                          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
@@ -794,13 +704,13 @@ const VSFrame* VS_CC nnedi3GetFrame(int n, int activationReason, void* instanceD
             const PlaneSetup& p = d->planes[plane];
             const bool hasList = d->pscrn > 0;
             VkDescriptorBufferInfo bufs[BindCount];
-            bufs[BindPad] = { s.padInfo.buffer, p.padOffset, p.padBytes };
+            bufs[BindPad] = { padInfo.buffer, p.padOffset, p.padBytes };
             bufs[BindDst] = { dstPlanes[plane].buffer, 0, VK_WHOLE_SIZE };
             bufs[BindPsW] = { d->weightsInfo.buffer, d->psWOffset, d->psWBytes };
             bufs[BindPdW] = { d->weightsInfo.buffer, d->pdWOffset, d->pdWBytes };
             bufs[BindPdB] = { d->weightsInfo.buffer, d->pdBOffset, d->pdBBytes };
-            bufs[BindList] = { s.devInfo.buffer, hasList ? p.listOffset : 0, hasList ? p.listBytes : VK_WHOLE_SIZE };
-            bufs[BindCnt] = { s.devInfo.buffer, hasList ? p.cntOffset : 0, hasList ? 16 : VK_WHOLE_SIZE };
+            bufs[BindList] = { devInfo.buffer, hasList ? p.listOffset : 0, hasList ? p.listBytes : VK_WHOLE_SIZE };
+            bufs[BindCnt] = { devInfo.buffer, hasList ? p.cntOffset : 0, hasList ? 16 : VK_WHOLE_SIZE };
             pushDescriptors(bufs, BindCount);
         };
 
@@ -822,7 +732,7 @@ const VSFrame* VS_CC nnedi3GetFrame(int n, int activationReason, void* instanceD
         };
 
         if (d->pscrn > 0) {
-            d->vk->vkCmdBindPipeline(s.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d->prescreenPipe);
+            d->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d->prescreenPipe);
             for (int plane = 0; plane < numPlanes; plane++) {
                 const PlaneSetup& p = d->planes[plane];
                 if (!p.process)
@@ -832,20 +742,17 @@ const VSFrame* VS_CC nnedi3GetFrame(int n, int activationReason, void* instanceD
                 const int pixPerThread = (d->pscrn == 1) ? 1 : 4;
                 const uint32_t threads = static_cast<uint32_t>(p.rows) *
                     ((static_cast<uint32_t>(p.width) + pixPerThread - 1) / pixPerThread);
-                d->vk->vkCmdDispatch(s.cmd, (threads + d->prescreenWG - 1) / d->prescreenWG, 1, 1);
+                d->vk->vkCmdDispatch(cmd, (threads + d->prescreenWG - 1) / d->prescreenWG, 1, 1);
             }
         }
 
-        if (d->profile)
-            d->vk->vkCmdWriteTimestamp2(s.cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, s.queryPool, 1);
-
         if (d->pscrn > 0)
-            cmdMemoryBarrier(d->vk, s.cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            cmdMemoryBarrier(d->vk, cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                              VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                              VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
                              VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT);
 
-        d->vk->vkCmdBindPipeline(s.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d->predictPipe);
+        d->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d->predictPipe);
         for (int plane = 0; plane < numPlanes; plane++) {
             const PlaneSetup& p = d->planes[plane];
             if (!p.process)
@@ -853,103 +760,38 @@ const VSFrame* VS_CC nnedi3GetFrame(int n, int activationReason, void* instanceD
             pushKernelDescriptors(plane);
             kernelPC(plane);
             if (d->pscrn > 0) {
-                d->vk->vkCmdDispatchIndirect(s.cmd, s.devInfo.buffer, p.cntOffset + 4);
+                d->vk->vkCmdDispatchIndirect(cmd, devInfo.buffer, p.cntOffset + 4);
             } else {
                 const uint32_t pixels = static_cast<uint32_t>(p.width) * static_cast<uint32_t>(p.rows);
-                d->vk->vkCmdDispatch(s.cmd, (pixels + d->pixelsPerPredictWG - 1) / d->pixelsPerPredictWG, 1, 1);
+                d->vk->vkCmdDispatch(cmd, (pixels + d->pixelsPerPredictWG - 1) / d->pixelsPerPredictWG, 1, 1);
             }
         }
 
-        if (d->profile) {
-            d->vk->vkCmdWriteTimestamp2(s.cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, s.queryPool, 2);
-            // Everything lands in the buckets above now; query 3 stays so the
-            // pool layout and the readback do not change.
-            d->vk->vkCmdWriteTimestamp2(s.cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, s.queryPool, 3);
-        }
-
-        VK_CHECK(d->vk->vkEndCommandBuffer(s.cmd));
-
-        // Wait the processed source planes' producers device side,
-        // deduplicated to the highest value per timeline.
-        VkSemaphoreSubmitInfo waits[3];
-        uint32_t waitCount = 0;
-        for (int plane = 0; plane < numPlanes; plane++) {
-            if (!d->planes[plane].process || !srcPlanes[plane].readySemaphore)
-                continue;
-            uint32_t w = 0;
-            for (; w < waitCount; w++) {
-                if (waits[w].semaphore == srcPlanes[plane].readySemaphore) {
-                    waits[w].value = std::max(waits[w].value, srcPlanes[plane].readyValue);
-                    break;
-                }
-            }
-            if (w == waitCount)
-                waits[waitCount++] = VkSemaphoreSubmitInfo{ .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-                                                            .semaphore = srcPlanes[plane].readySemaphore,
-                                                            .value = srcPlanes[plane].readyValue,
-                                                            .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT };
-        }
-
-        const VkCommandBufferSubmitInfo cbsi{ .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
-                                              .commandBuffer = s.cmd };
-        VkSemaphoreSubmitInfo signal{ .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-                                      .semaphore = d->timeline,
-                                      .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT };
-        VkSubmitInfo2 si{ .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
-                          .waitSemaphoreInfoCount = waitCount,
-                          .pWaitSemaphoreInfos = waitCount ? waits : nullptr,
-                          .commandBufferInfoCount = 1,
-                          .pCommandBufferInfos = &cbsi,
-                          .signalSemaphoreInfoCount = 1,
-                          .pSignalSemaphoreInfos = &signal };
-
-        // Value allocation and submission belong inside the queue lock
-        // together, keeping this instance's timeline signals in increasing
-        // order on the queue.
-        uint64_t value;
-        d->vkapi->lockVulkanQueue(core, vqCompute);
-        value = ++d->nextValue;
-        signal.value = value;
-        const VkResult submitRes = d->vk->vkQueueSubmit2(d->computeQueue, 1, &si, VK_NULL_HANDLE);
-        d->vkapi->unlockVulkanQueue(core, vqCompute);
-        VK_CHECK(submitRes);
-
-        s.lastValue = value;
-        s.profilePending = d->profile;
-
+        // The source planes' producers become device side waits and the frame
+        // stays alive until this submission completes; the planes written get
+        // this submission's producer pair published on them at submit.
+        d->vkapi->gpuExecReadsFrame(ctx, src);
         for (int plane = 0; plane < numPlanes; plane++)
             if (d->planes[plane].process)
-                d->vkapi->setGPUPlaneProducer(dst, plane, d->timeline, value);
+                d->vkapi->gpuExecWritesPlane(ctx, dst, plane);
 
-        // The source reference is handed to the retained ring instead of
-        // being freed: the GPU may still be reading it long after this
-        // function returns.
-        {
-            std::unique_lock<std::mutex> lock(d->streamMutex);
-            if (d->retainedCount < MAX_RETAINED) {
-                d->retained[d->retainedCount].frame = src;
-                d->retained[d->retainedCount].value = value;
-                d->retainedCount++;
-                src = nullptr;
-            }
+        if (d->vkapi->gpuExecSubmit(ctx, verr, sizeof(verr))) {
+            ctx = nullptr; // consumed either way
+            throw std::runtime_error(verr);
         }
-        if (src) {
-            // Ring full: fall back to a blocking wait so correctness never
-            // depends on luck.
-            d->waitValue(value);
-            vsapi->freeFrame(src);
-            src = nullptr;
-        }
+        ctx = nullptr;
     } catch (const std::exception& e) {
-        releaseStream();
+        if (ctx)
+            d->vkapi->gpuExecAbandon(ctx);
         vsapi->setFilterError(("NNEDI3VK: "s + e.what()).c_str(), frameCtx);
-        if (src)
-            vsapi->freeFrame(src);
+        vsapi->freeFrame(src);
         vsapi->freeFrame(dst);
         return nullptr;
     }
 
-    releaseStream();
+    // The pool holds its own reference for as long as the GPU needs the frame,
+    // so this one is released the ordinary way.
+    vsapi->freeFrame(src);
 
     VSMap* props = vsapi->getFramePropertiesRW(dst);
     vsapi->mapSetInt(props, "_FieldBased", VSC_FIELD_PROGRESSIVE, maReplace);
@@ -998,62 +840,30 @@ void uploadWeights(NNEDI3Data* d, VSCore* core, const void* data, VkDeviceSize b
     if (!staging)
         throw std::runtime_error("weights staging buffer: "s + verr);
 
-    VkCommandPool pool = VK_NULL_HANDLE;
     try {
         std::memcpy(stagingInfo.mapped, data, bytes);
 
-        const VkCommandPoolCreateInfo cpi{ .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-                                           .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
-                                           .queueFamilyIndex = d->h.computeQueueFamily };
-        VK_CHECK(d->vk->vkCreateCommandPool(device, &cpi, nullptr, &pool));
-
-        const VkCommandBufferAllocateInfo cbai{ .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-                                                .commandPool = pool,
-                                                .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-                                                .commandBufferCount = 1 };
-        VkCommandBuffer cmd;
-        VK_CHECK(d->vk->vkAllocateCommandBuffers(device, &cbai, &cmd));
-
-        const VkCommandBufferBeginInfo cbbi{ .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-                                             .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
-        VK_CHECK(d->vk->vkBeginCommandBuffer(cmd, &cbbi));
+        // One shot: record the copy in a pool context, submit, and drain, since
+        // everything recorded afterwards reads these weights.
+        VSGPUExecContext* ctx = d->vkapi->gpuExecAcquire(d->execPool, verr, sizeof(verr));
+        if (!ctx)
+            throw std::runtime_error("weights upload: "s + verr);
         const VkBufferCopy2 region{ .sType = VK_STRUCTURE_TYPE_BUFFER_COPY_2, .size = bytes };
         const VkCopyBufferInfo2 copy{ .sType = VK_STRUCTURE_TYPE_COPY_BUFFER_INFO_2,
                                       .srcBuffer = stagingInfo.buffer,
                                       .dstBuffer = d->weightsInfo.buffer,
                                       .regionCount = 1,
                                       .pRegions = &region };
-        d->vk->vkCmdCopyBuffer2(cmd, &copy);
-        VK_CHECK(d->vk->vkEndCommandBuffer(cmd));
-
-        const VkCommandBufferSubmitInfo cbsi{ .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
-                                              .commandBuffer = cmd };
-        VkSemaphoreSubmitInfo signal{ .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-                                      .semaphore = d->timeline,
-                                      .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT };
-        const VkSubmitInfo2 si{ .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
-                                .commandBufferInfoCount = 1,
-                                .pCommandBufferInfos = &cbsi,
-                                .signalSemaphoreInfoCount = 1,
-                                .pSignalSemaphoreInfos = &signal };
-
-        uint64_t value;
-        d->vkapi->lockVulkanQueue(core, vqCompute);
-        value = ++d->nextValue;
-        signal.value = value;
-        const VkResult submitRes = d->vk->vkQueueSubmit2(d->computeQueue, 1, &si, VK_NULL_HANDLE);
-        d->vkapi->unlockVulkanQueue(core, vqCompute);
-        VK_CHECK(submitRes);
-
-        d->waitValue(value);
+        d->vk->vkCmdCopyBuffer2(d->vkapi->gpuExecCommandBuffer(ctx), &copy);
+        if (d->vkapi->gpuExecSubmit(ctx, verr, sizeof(verr)))
+            throw std::runtime_error("weights upload: "s + verr);
+        if (d->vkapi->gpuExecPoolWaitIdle(d->execPool, verr, sizeof(verr)))
+            throw std::runtime_error("weights upload: "s + verr);
     } catch (...) {
-        if (pool)
-            d->vk->vkDestroyCommandPool(device, pool, nullptr);
         d->vkapi->destroyGPUBuffer(staging);
         throw;
     }
 
-    d->vk->vkDestroyCommandPool(device, pool, nullptr);
     d->vkapi->destroyGPUBuffer(staging);
 }
 
@@ -1192,48 +1002,6 @@ void setupVulkanObjects(NNEDI3Data* d, VSCore* core, int numStreams, int32_t xdi
         makePipeline(d->predictModule, pspec, true, &d->predictPipe);
     }
 
-    // Per-stream command state and scratch, from the core's pooled allocator.
-    for (int i = 0; i < numStreams; i++) {
-        auto s = std::make_unique<StreamCtx>();
-
-        const VkCommandPoolCreateInfo cpi{ .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-                                           .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
-                                           .queueFamilyIndex = d->h.computeQueueFamily };
-        VK_CHECK(d->vk->vkCreateCommandPool(device, &cpi, nullptr, &s->pool));
-
-        const VkCommandBufferAllocateInfo cbai{ .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-                                                .commandPool = s->pool,
-                                                .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-                                                .commandBufferCount = 1 };
-        VK_CHECK(d->vk->vkAllocateCommandBuffers(device, &cbai, &s->cmd));
-
-        if (d->profile) {
-            const VkQueryPoolCreateInfo qpci{ .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
-                                              .queryType = VK_QUERY_TYPE_TIMESTAMP,
-                                              .queryCount = 4 };
-            VK_CHECK(d->vk->vkCreateQueryPool(device, &qpci, nullptr, &s->queryPool));
-            d->vk->vkResetQueryPool(device, s->queryPool, 0, 4);
-        }
-
-        s->padBuf = d->vkapi->createGPUBuffer(core, d->padSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, &s->padInfo, verr, sizeof(verr));
-        if (!s->padBuf) {
-            d->streams.push_back(std::move(s));
-            throw std::runtime_error("pad scratch buffer: "s + verr);
-        }
-
-        s->devBuf = d->vkapi->createGPUBuffer(core, d->devbufSize,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
-            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, &s->devInfo, verr, sizeof(verr));
-        if (!s->devBuf) {
-            d->streams.push_back(std::move(s));
-            throw std::runtime_error("device scratch buffer: "s + verr);
-        }
-
-        d->freeStreams.push_back(i);
-        d->streams.push_back(std::move(s));
-    }
 }
 
 int getIntDef(const VSAPI* vsapi, const VSMap* in, const char* name, int def) {
@@ -1420,20 +1188,6 @@ void VS_CC nnedi3Create(const VSMap* in, VSMap* out, [[maybe_unused]] void* user
                 throw std::runtime_error("FP16 input requires shaderFloat16 device support");
         }
 
-        // The filter's timeline, created before the weights upload uses it; exportable when
-        // the device can, so downstream CUDA/foreign consumers may wait the producer pairs
-        // device side.
-        VSVulkanCoreInfo coreInfo{};
-        d->vkapi->getVulkanCoreInfo(core, &coreInfo, verr, sizeof(verr));
-        const VkExportSemaphoreCreateInfo sesci{ .sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO,
-                                                 .handleTypes = static_cast<VkExternalSemaphoreHandleTypeFlags>(coreInfo.semaphoreExportHandleType) };
-        const VkSemaphoreTypeCreateInfo stci{ .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
-                                              .pNext = coreInfo.semaphoreExportHandleType ? &sesci : nullptr,
-                                              .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
-                                              .initialValue = 0 };
-        const VkSemaphoreCreateInfo sci{ .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &stci };
-        VK_CHECK(d->vk->vkCreateSemaphore(d->h.device, &sci, nullptr, &d->timeline));
-
         // Plane layout / buffer sizes.
         const int bps = d->vi.format.bytesPerSample;
         VkDeviceSize padOff = 0, devOff = 0;
@@ -1565,6 +1319,12 @@ void VS_CC nnedi3Create(const VSMap* in, VSMap* out, [[maybe_unused]] void* user
         std::memcpy(weightsBlob.data() + d->psWOffset, psBlob.data(), d->psWBytes);
         std::memcpy(weightsBlob.data() + d->pdWOffset, pdWData, d->pdWBytes);
         std::memcpy(weightsBlob.data() + d->pdBOffset, pdBias.data(), d->pdBBytes);
+
+        // The pool comes first: the weights upload records through it, and every
+        // frame afterwards does too.
+        d->execPool = d->vkapi->createGPUExecPool(core, vqCompute, numStreams, verr, sizeof(verr));
+        if (!d->execPool)
+            throw std::runtime_error("exec pool: "s + verr);
 
         uploadWeights(d.get(), core, weightsBlob.data(), weightsBlob.size());
 
