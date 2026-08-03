@@ -449,7 +449,7 @@ struct NNEDI3Data {
     double prescreenMs = 0.0, predictMs = 0.0, copyMs = 0.0;
     int64_t profiledFrames = 0;
 
-    void destroy(const VSAPI* vsapi) {
+    void destroy() {
         if (!vk)
             return;
         const VkDevice device = h.device;
@@ -813,7 +813,7 @@ const VSFrame* VS_CC nnedi3GetFrame(int n, int activationReason, void* instanceD
 
 void VS_CC nnedi3Free(void* instanceData, [[maybe_unused]] VSCore* core, const VSAPI* vsapi) {
     auto d = static_cast<NNEDI3Data*>(instanceData);
-    d->destroy(vsapi);
+    d->destroy();
     vsapi->freeNode(d->node);
     delete d;
 }
@@ -825,7 +825,6 @@ void VS_CC nnedi3Free(void* instanceData, [[maybe_unused]] VSCore* core, const V
 // staging copy on the core's compute queue.
 void uploadWeights(NNEDI3Data* d, VSCore* core, const void* data, VkDeviceSize bytes) {
     char verr[512] = { 0 };
-    const VkDevice device = d->h.device;
 
     d->weightsBuf = d->vkapi->createGPUBuffer(core, bytes,
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -867,11 +866,10 @@ void uploadWeights(NNEDI3Data* d, VSCore* core, const void* data, VkDeviceSize b
     d->vkapi->destroyGPUBuffer(staging);
 }
 
-void setupVulkanObjects(NNEDI3Data* d, VSCore* core, int numStreams, int32_t xdim, int32_t ydim, int32_t nns,
+void setupVulkanObjects(NNEDI3Data* d, int32_t xdim, int32_t ydim, int32_t nns,
                         uint32_t maxWGInvocations, uint32_t maxWGSizeX) {
     const VkDevice device = d->h.device;
     const int pixelType = d->pixelType;
-    char verr[512] = { 0 };
 
     {
         const VkShaderModuleCreateInfo smci{ .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
@@ -1328,7 +1326,7 @@ void VS_CC nnedi3Create(const VSMap* in, VSMap* out, [[maybe_unused]] void* user
 
         uploadWeights(d.get(), core, weightsBlob.data(), weightsBlob.size());
 
-        setupVulkanObjects(d.get(), core, numStreams, static_cast<int32_t>(model.xdim),
+        setupVulkanObjects(d.get(), static_cast<int32_t>(model.xdim),
                            static_cast<int32_t>(model.ydim), static_cast<int32_t>(model.nns),
                            maxWGInvocations, maxWGSizeX);
     } catch (const std::exception& e) {
