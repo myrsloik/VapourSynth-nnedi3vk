@@ -13,7 +13,7 @@ VapourSynth R73+ with GPU support (API 4.3), and a Vulkan 1.4 capable GPU and dr
 ## Usage
 
 ```py
-nnedi3vk.NNEDI3(vnode:gpu clip, int field[, bint dh=False, int[] planes=[0, 1, 2], int nsize=6, int nns=1, int qual=1, int etype=0, int pscrn=2, int num_streams=2])
+nnedi3vk.NNEDI3(vnode:gpu clip, int field[, bint dh=False, int[] planes=[0, 1, 2], int nsize=6, int nns=1, int qual=1, int etype=0, int pscrn=2])
 ```
 
 - clip: Clip to process. Any format with either 8-16 bit integer or 16/32 bit float is supported.
@@ -57,9 +57,7 @@ nnedi3vk.NNEDI3(vnode:gpu clip, int field[, bint dh=False, int[] planes=[0, 1, 2
   - 3 = new prescreener level 1
   - 4 = new prescreener level 2
 
-- num_streams: Number of frames the filter keeps in flight on the GPU at once.
-
-Removed relative to the standalone (pre-GPU-node) versions: `device_index` and `list_device` (device selection is core-wide now) and `coopvec` (the core device enables no vendor extensions; the FP32 subgroup GEMV path is used on all hardware).
+Removed relative to the standalone (pre-GPU-node) versions: `device_index` and `list_device` (device selection is core-wide now), `coopvec` (the core device enables no vendor extensions; the FP32 subgroup GEMV path is used on all hardware), and `num_streams` (the core's execution pool sizes the in-flight bound from its worker threads and budgets the pinned memory itself).
 
 
 ## Installation

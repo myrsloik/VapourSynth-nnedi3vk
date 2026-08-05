@@ -440,8 +440,9 @@ struct NNEDI3Data {
     uint32_t pixelsPerPredictWG = 4; // predict: pixels per workgroup
 
     // The core's exec pool owns the timeline, the command buffers and the in
-    // flight bound (num_streams contexts), and it keeps source frames and
-    // scratch alive until the submissions using them complete.
+    // flight bound (context count derived from the core's worker threads), and
+    // it keeps source frames and scratch alive until the submissions using
+    // them complete.
     VSGPUExecPool* execPool = nullptr;
 
     bool profile = false;
@@ -1048,7 +1049,6 @@ void VS_CC nnedi3Create(const VSMap* in, VSMap* out, [[maybe_unused]] void* user
         d->qual = getIntDef(vsapi, in, "qual", 1);
         const int etype = getIntDef(vsapi, in, "etype", 0);
         d->pscrn = getIntDef(vsapi, in, "pscrn", 2);
-        const int numStreams = getIntDef(vsapi, in, "num_streams", 2);
 
         if (d->field < 0 || d->field > 3)
             throw std::runtime_error("field must be 0, 1, 2, or 3");
@@ -1075,9 +1075,6 @@ void VS_CC nnedi3Create(const VSMap* in, VSMap* out, [[maybe_unused]] void* user
 
         if (d->pscrn < 0 || d->pscrn > 4)
             throw std::runtime_error("pscrn must be between 0 and 4 (inclusive)");
-
-        if (numStreams < 1)
-            throw std::runtime_error("num_streams must be greater than or equal to 1");
 
         if (d->field > 1) {
             if (d->vi.numFrames > INT_MAX / 2)
@@ -1320,7 +1317,7 @@ void VS_CC nnedi3Create(const VSMap* in, VSMap* out, [[maybe_unused]] void* user
 
         // The pool comes first: the weights upload records through it, and every
         // frame afterwards does too.
-        d->execPool = d->vkapi->createGPUExecPool(core, vqCompute, numStreams, verr, sizeof(verr));
+        d->execPool = d->vkapi->createGPUExecPool(core, vqCompute, verr, sizeof(verr));
         if (!d->execPool)
             throw std::runtime_error("exec pool: "s + verr);
 
@@ -1361,8 +1358,7 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin* plugin, const VSPLUGINAPI
                              "nns:int:opt;"
                              "qual:int:opt;"
                              "etype:int:opt;"
-                             "pscrn:int:opt;"
-                             "num_streams:int:opt;",
+                             "pscrn:int:opt;",
                              "clip:vnode:gpu;",
                              nnedi3Create,
                              nullptr,
