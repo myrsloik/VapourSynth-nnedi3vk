@@ -15,32 +15,40 @@
     along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
-// Converted to the VapourSynth GPU node API: frames stay resident on the
-// core's Vulkan device (clip:vnode:gpu in and out), all Vulkan calls go through
-// the core's dispatch table, and the former CPU stages — building the padded
-// field plane and interleaving the interpolated rows into the output frame —
-// run on the GPU (pad.comp and buffer copies recorded into the same
-// submission). Nothing is uploaded or downloaded per frame anymore; the
-// filter chains asynchronously through per-plane producer pairs like any
-// other GPU filter. Scratch memory comes from the core's pooled VRAM
-// allocator, so it is budgeted and recycled centrally.
+// Implemented on the core's gpufilter.h declaration driver, verbatim -- no
+// local extensions: the filter declares its programs, passes and operands
+// once, plus callbacks for push constants, per-frame field parity and frame
+// property fixup, and the driver owns everything the previous version
+// recorded by hand -- output allocation with plane sharing, the exec pool and
+// its contexts, source retention, scratch and constant buffers, barriers,
+// descriptor pushes, dispatch and submission.
 //
-// Relative to the standalone version this drops: the private instance/device
-// (volk + VMA), the device_index/list_device arguments (device selection is
-// core-wide now, core.set_vulkan_device), the readback machinery, and the
-// VK_NV_cooperative_vector predict path (the core device enables no vendor
-// extensions).
+// The predict kernel is dispatched over the worst case (every interpolated
+// pixel) instead of the indirect dispatch earlier versions used: it already
+// bounds itself by the prescreener's compacted count, so the workgroups past
+// the list retire on one uniform load -- tens of microseconds a frame at
+// 1080p, which is what expressing the filter without the indirect dispatch
+// extension costs. The prescreener accordingly no longer maintains dispatch
+// arguments, only the append counter.
+//
+// What the declaration cannot say, callbacks say: the pad plane and the pixel
+// list are not shaped like any frame plane (Pass::reshape), and the list
+// counter is reset by a one-thread kernel the driver compiles from source at
+// creation instead of a vkCmdFillBuffer. dh with unprocessed planes zero
+// fills them through a dedicated pass: the driver shares unprocessed planes
+// from the source, which a doubled height makes impossible, and the
+// hand-recorded version's "left unwritten" is not part of its model. The GPU
+// profiling of the hand-recorded version (NNEDI3VK_PROFILE) is gone: the
+// driver has no timestamp hook, and it was a debug aid.
 
 #include <algorithm>
 #include <array>
-#include <condition_variable>
+#include <cassert>
 #include <cstdint>
-#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <memory>
-#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -50,6 +58,8 @@
 #include <VSConstants4.h>
 #include <VSHelper4.h>
 #include <VSVulkan4.h>
+
+#include "gpufilter.h"
 
 using namespace std::string_literals;
 
@@ -118,35 +128,6 @@ constexpr SpvBlob kSpv[3][4] = {
       { predictF16Spv, sizeof(predictF16Spv) },
       { predictF32Spv, sizeof(predictF32Spv) } },
 };
-
-#define VK_CHECK(expr)                                                                             \
-    do {                                                                                           \
-        const VkResult vkCheckResult_ = (expr);                                                    \
-        if (vkCheckResult_ != VK_SUCCESS)                                                          \
-            throw std::runtime_error(#expr " failed with VkResult "s +                             \
-                                     std::to_string(static_cast<int>(vkCheckResult_)));            \
-    } while (0)
-
-VkDeviceSize alignUp(VkDeviceSize v, VkDeviceSize a) {
-    return (v + a - 1) & ~(a - 1);
-}
-
-// Sub-allocation alignment within the shared pad/device buffers (the spec
-// caps minStorageBufferOffsetAlignment at 256).
-constexpr VkDeviceSize BUF_ALIGN = 256;
-
-// Reserves bytes at the next aligned offset and returns that offset.
-VkDeviceSize suballoc(VkDeviceSize& off, VkDeviceSize bytes) {
-    off = alignUp(off, BUF_ALIGN);
-    const VkDeviceSize o = off;
-    off += bytes;
-    return o;
-}
-
-bool envFlag(const char* name) {
-    const char* env = std::getenv(name);
-    return env && env[0] && env[0] != '0';
-}
 
 // Round-to-nearest-even float32 -> float16 conversion.
 uint16_t floatToHalf(float f) {
@@ -344,7 +325,7 @@ void readNNEDI3Weights(const float* data, unsigned nsizeSel, unsigned nnsSel, un
 }
 
 //////////////////////////////////////////
-// Filter data
+// Push constants / specialization
 
 // Field order and types must match the PC push-constant block in
 // shaders/common.glsl (scalar layout makes the correspondence purely
@@ -379,629 +360,63 @@ struct SpecData {
     VkBool32 useList;
 };
 
-// Storage-buffer binding indices; must match the layout(binding = N)
-// declarations across the kernels. The pad kernel reuses BindPad as its
-// source plane and BindDst as the padded output.
-enum Binding : uint32_t {
-    BindPad = 0,
-    BindDst,
-    BindPsW,
-    BindPdW,
-    BindPdB,
-    BindList,
-    BindCnt,
-    BindCount,
+constexpr VkSpecializationMapEntry specEntries[] = {
+    { 0, offsetof(SpecData, wgSize), sizeof(uint32_t) },
+    { 1, offsetof(SpecData, pscrn), sizeof(int32_t) },
+    { 2, offsetof(SpecData, xdim), sizeof(int32_t) },
+    { 3, offsetof(SpecData, ydim), sizeof(int32_t) },
+    { 4, offsetof(SpecData, nns), sizeof(int32_t) },
+    { 5, offsetof(SpecData, qual), sizeof(int32_t) },
+    { 6, offsetof(SpecData, sgSize), sizeof(int32_t) },
+    { 7, offsetof(SpecData, subgroups), sizeof(int32_t) },
+    { 8, offsetof(SpecData, useList), sizeof(VkBool32) },
 };
 
-struct PlaneSetup {
-    bool process = false;
-    int width = 0, height = 0; // output plane dimensions
-    int rows = 0;              // interpolated rows (= field height)
-    int padStride = 0, padHeight = 0;
-    VkDeviceSize padOffset = 0, padBytes = 0;   // pad scratch buffer
-    VkDeviceSize listOffset = 0, listBytes = 0; // device scratch buffer
-    VkDeviceSize cntOffset = 0;                 // device scratch buffer, 16 bytes
-};
+// Resets the prescreener's append counter; replaces the vkCmdFillBuffer of
+// the hand-recorded version, since a declared pass is all the driver offers --
+// and one thread of one kernel is exactly as cheap. Words 1..3 of the block
+// are dead space (the retired indirect dispatch arguments), cleared along
+// with the counter to keep the kernels' 16 byte block layout unchanged.
+const char resetGlsl[] =
+    "#version 460\n"
+    "layout(local_size_x = 1) in;\n"
+    "layout(std430, binding = 0) writeonly buffer Cnt { uint cnt[]; };\n"
+    "void main() { cnt[0] = 0u; cnt[1] = 0u; cnt[2] = 1u; cnt[3] = 1u; }\n";
 
-struct NNEDI3Data {
-    VSNode* node = nullptr;
-    VSVideoInfo vi{};
-    int field = 0;
+// Zero fills a plane as 4 byte words (strides are at least 32 byte aligned,
+// so every plane's bytes divide); pc.width carries the word count. Only used
+// for dh with unprocessed planes, whose doubled height makes sharing the
+// source plane impossible.
+const char zeroGlsl[] =
+    "#version 460\n"
+    "layout(local_size_x = 256) in;\n"
+    "layout(std430, binding = 0) writeonly buffer Dst { uint d[]; };\n"
+    "layout(push_constant, std430) uniform PC { int width; } pc;\n"
+    "void main() {\n"
+    "    if (gl_GlobalInvocationID.x < uint(pc.width))\n"
+    "        d[gl_GlobalInvocationID.x] = 0u;\n"
+    "}\n";
+
+//////////////////////////////////////////
+// The declaration's shared state
+
+// Everything the desc callbacks need per dispatch, computed once at creation
+// and shared by the capturing lambdas (the driver copies the desc, so the
+// lambdas and this state live exactly as long as the filter instance).
+struct NNEDI3State {
+    bool process[3] = {};
+    int width[3] = {}, rows[3] = {};
+    int padStride[3] = {}, padHeight[3] = {};
+    int outHeight[3] = {}; // full output plane height, set for every plane
+    int bps = 0, peak = 0;
+    int field = 0, pscrn = 0;
     bool dh = false;
-    int qual = 1, pscrn = 2;
-    int peak = 0, pixelType = 0;
-
-    const VSVULKANAPI* vkapi = nullptr;
-    VSVulkanCoreHandles h{};
-    const VSVulkanFunctions* vk = nullptr; // the core's dispatch table
-    VkQueue computeQueue = VK_NULL_HANDLE;
-
-    uint32_t subgroupSize = 32;
-    bool canRequireSubgroupSize = false;
-    double timestampPeriod = 0.0;
-
-    VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
-    VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
-    VkShaderModule padModule = VK_NULL_HANDLE, rowcopyModule = VK_NULL_HANDLE;
-    VkShaderModule prescreenModule = VK_NULL_HANDLE, predictModule = VK_NULL_HANDLE;
-    VkPipeline padPipe = VK_NULL_HANDLE, rowcopyPipe = VK_NULL_HANDLE;
-    VkPipeline prescreenPipe = VK_NULL_HANDLE, predictPipe = VK_NULL_HANDLE;
-
-    VSGPUBuffer* weightsBuf = nullptr;
-    VSVulkanBufferInfo weightsInfo{};
-    VkDeviceSize psWOffset = 0, psWBytes = 0;
-    VkDeviceSize pdWOffset = 0, pdWBytes = 0;
-    VkDeviceSize pdBOffset = 0, pdBBytes = 0;
-
-    PlaneSetup planes[3];
-    VkDeviceSize padSize = 0, devbufSize = 0;
-
-    uint32_t prescreenWG = 128;      // prescreen workgroup size (threads)
-    uint32_t pixelsPerPredictWG = 4; // predict: pixels per workgroup
-
-    // The core's exec pool owns the timeline, the command buffers and the in
-    // flight bound (context count derived from the core's worker threads), and
-    // it keeps source frames and scratch alive until the submissions using
-    // them complete.
-    VSGPUExecPool* execPool = nullptr;
-
-    bool profile = false;
-    std::mutex profileMutex;
-    double prescreenMs = 0.0, predictMs = 0.0, copyMs = 0.0;
-    int64_t profiledFrames = 0;
-
-    void destroy() {
-        if (!vk)
-            return;
-        const VkDevice device = h.device;
-        // Drains the GPU and releases every frame and scratch buffer still
-        // held by an unfinished submission.
-        if (execPool)
-            vkapi->freeGPUExecPool(execPool);
-        execPool = nullptr;
-        if (padPipe)
-            vk->vkDestroyPipeline(device, padPipe, nullptr);
-        if (rowcopyPipe)
-            vk->vkDestroyPipeline(device, rowcopyPipe, nullptr);
-        if (prescreenPipe)
-            vk->vkDestroyPipeline(device, prescreenPipe, nullptr);
-        if (predictPipe)
-            vk->vkDestroyPipeline(device, predictPipe, nullptr);
-        if (padModule)
-            vk->vkDestroyShaderModule(device, padModule, nullptr);
-        if (rowcopyModule)
-            vk->vkDestroyShaderModule(device, rowcopyModule, nullptr);
-        if (prescreenModule)
-            vk->vkDestroyShaderModule(device, prescreenModule, nullptr);
-        if (predictModule)
-            vk->vkDestroyShaderModule(device, predictModule, nullptr);
-        if (pipelineLayout)
-            vk->vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
-        if (dsl)
-            vk->vkDestroyDescriptorSetLayout(device, dsl, nullptr);
-        if (weightsBuf)
-            vkapi->destroyGPUBuffer(weightsBuf);
-
-        if (profile && profiledFrames > 0)
-            std::fprintf(stderr,
-                         "nnedi3vk profile: frames=%lld pad+prescreen=%.3fms predict=%.3fms assemble=%.3fms (per frame GPU time)\n",
-                         static_cast<long long>(profiledFrames), prescreenMs / profiledFrames,
-                         predictMs / profiledFrames, copyMs / profiledFrames);
-    }
+    // Pass indices in the declared pass list, -1 when absent.
+    int passRowcopy = -1, passPad = -1, passPrescreen = -1, passPredict = -1, passZero = -1;
 };
 
 //////////////////////////////////////////
-// GPU recording
-
-void cmdMemoryBarrier(const VSVulkanFunctions* vk, VkCommandBuffer cmd, VkPipelineStageFlags2 srcStage,
-                      VkAccessFlags2 srcAccess, VkPipelineStageFlags2 dstStage, VkAccessFlags2 dstAccess) {
-    const VkMemoryBarrier2 mb{ .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
-                               .srcStageMask = srcStage,
-                               .srcAccessMask = srcAccess,
-                               .dstStageMask = dstStage,
-                               .dstAccessMask = dstAccess };
-    const VkDependencyInfo dep{ .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-                                .memoryBarrierCount = 1,
-                                .pMemoryBarriers = &mb };
-    vk->vkCmdPipelineBarrier2(cmd, &dep);
-}
-
-//////////////////////////////////////////
-// getFrame
-
-const VSFrame* VS_CC nnedi3GetFrame(int n, int activationReason, void* instanceData, [[maybe_unused]] void** frameData, VSFrameContext* frameCtx, VSCore* core,
-                                    const VSAPI* vsapi) {
-    auto d = static_cast<NNEDI3Data*>(instanceData);
-
-    // Source frame number (field > 1 doubles the output frame rate).
-    const int sn = d->field > 1 ? n / 2 : n;
-
-    if (activationReason == arInitial) {
-        vsapi->requestFrameFilter(sn, d->node, frameCtx);
-        return nullptr;
-    }
-
-    if (activationReason != arAllFramesReady)
-        return nullptr;
-
-    const VSFrame* src = vsapi->getFrameFilter(sn, d->node, frameCtx);
-
-    // Processed planes are written fresh on the GPU; unprocessed planes are
-    // shared, producer pairs riding along.
-    VSFrame* dst;
-    {
-        bool anyShared = false;
-        const VSFrame* planeSrc[3] = {};
-        int planeNo[3] = {};
-        for (int plane = 0; plane < d->vi.format.numPlanes; plane++) {
-            planeSrc[plane] = (d->dh || d->planes[plane].process) ? nullptr : src;
-            planeNo[plane] = plane;
-            anyShared = anyShared || planeSrc[plane];
-        }
-        if (anyShared)
-            dst = vsapi->newVideoFrame2(&d->vi.format, d->vi.width, d->vi.height, planeSrc, planeNo, src, core);
-        else
-            dst = d->vkapi->newGPUVideoFrame(&d->vi.format, d->vi.width, d->vi.height, src, core);
-    }
-
-    // Source field parity, mirroring vsznedi3's get_src_parity exactly.
-    // parity == 1 means the source is (treated as) the bottom field.
-    const VSMap* srcProps = vsapi->getFramePropertiesRO(src);
-    const int defaultParity = (d->field == 0 || d->field == 2) ? 1 : 0;
-    int parity;
-    int err;
-    if (d->dh) {
-        const int fieldProp = vsapi->mapGetIntSaturated(srcProps, "_Field", 0, &err);
-        parity = err ? defaultParity : fieldProp;
-    } else if (d->field > 1) {
-        const int fieldBased = vsapi->mapGetIntSaturated(srcProps, "_FieldBased", 0, &err);
-        parity = fieldBased == VSC_FIELD_BOTTOM ? 1 : fieldBased == VSC_FIELD_TOP ? 0 : defaultParity;
-        if (n % 2)
-            parity = !parity;
-    } else {
-        parity = d->field == 0 ? 1 : 0;
-    }
-    parity = !!parity;
-
-    const int fp = !parity; // znedi3 PadFilter parity
-    const int bps = d->vi.format.bytesPerSample;
-
-    // Claim a recording slot; the pool waits out the oldest submission, which
-    // is this instance's in flight bound.
-    char verr[512] = { 0 };
-    VSGPUExecContext* ctx = d->vkapi->gpuExecAcquire(d->execPool, verr, sizeof(verr));
-    if (!ctx) {
-        vsapi->setFilterError(("NNEDI3VK: "s + verr).c_str(), frameCtx);
-        vsapi->freeFrame(src);
-        vsapi->freeFrame(dst);
-        return nullptr;
-    }
-    const VkCommandBuffer cmd = d->vkapi->gpuExecCommandBuffer(ctx);
-    VSVulkanBufferInfo padInfo{}, devInfo{};
-
-    try {
-        // Per frame scratch out of the core's pooled allocator: the exec pool
-        // destroys both once this submission completes, so the recycled block
-        // is back in the bucket by the next frame.
-        VSGPUBuffer* padBuf = d->vkapi->createGPUBuffer(core, d->padSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, &padInfo, verr, sizeof(verr));
-        if (!padBuf)
-            throw std::runtime_error("pad scratch buffer: "s + verr);
-        d->vkapi->gpuExecUsesBuffer(ctx, padBuf);
-
-        VSGPUBuffer* devBuf = d->vkapi->createGPUBuffer(core, d->devbufSize,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
-            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, &devInfo, verr, sizeof(verr));
-        if (!devBuf)
-            throw std::runtime_error("device scratch buffer: "s + verr);
-        d->vkapi->gpuExecUsesBuffer(ctx, devBuf);
-
-        const int numPlanes = d->vi.format.numPlanes;
-
-        VSVulkanPlaneInfo srcPlanes[3]{}, dstPlanes[3]{};
-        for (int plane = 0; plane < numPlanes; plane++) {
-            if (!d->planes[plane].process)
-                continue;
-            if (d->vkapi->getGPUPlane(src, plane, &srcPlanes[plane]) ||
-                d->vkapi->getGPUPlane(dst, plane, &dstPlanes[plane]))
-                throw std::runtime_error("plane is not GPU resident");
-        }
-
-        auto pushPC = [&](const PushConstants& pcv) {
-            const VkPushConstantsInfo pi{ .sType = VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO,
-                                          .layout = d->pipelineLayout,
-                                          .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
-                                          .size = sizeof(pcv),
-                                          .pValues = &pcv };
-            d->vk->vkCmdPushConstants2(cmd, &pi);
-        };
-
-        auto pushDescriptors = [&](const VkDescriptorBufferInfo* bufs, uint32_t count) {
-            VkWriteDescriptorSet writes[BindCount];
-            for (uint32_t i = 0; i < count; i++)
-                writes[i] = VkWriteDescriptorSet{ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                                                  .dstBinding = i,
-                                                  .descriptorCount = 1,
-                                                  .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                                                  .pBufferInfo = &bufs[i] };
-            d->vk->vkCmdPushDescriptorSet(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d->pipelineLayout, 0, count, writes);
-        };
-
-        // Pass-through rows: the source field's rows land unchanged at output
-        // rows parity + 2r (or every source row when dh). Byte addressed, so
-        // every push constant of the rowcopy kernel is in bytes.
-        d->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d->rowcopyPipe);
-        for (int plane = 0; plane < numPlanes; plane++) {
-            const PlaneSetup& p = d->planes[plane];
-            if (!p.process)
-                continue;
-            const int srcStride = static_cast<int>(vsapi->getStride(src, plane));
-            const int dstStride = static_cast<int>(vsapi->getStride(dst, plane));
-            const int rowBytes = p.width * bps;
-            const VkDescriptorBufferInfo bufs[2] = {
-                { srcPlanes[plane].buffer, 0, VK_WHOLE_SIZE },
-                { dstPlanes[plane].buffer, 0, VK_WHOLE_SIZE },
-            };
-            pushDescriptors(bufs, 2);
-            pushPC(PushConstants{ .width = rowBytes,
-                                  .rows = p.rows,
-                                  .padStride = 0,
-                                  .peak = 0,
-                                  .srcStride = 0,
-                                  .rowOff = d->dh ? 0 : parity * srcStride,
-                                  .rowScale = srcStride * (d->dh ? 1 : 2),
-                                  .fp = 0,
-                                  .dstBase = parity * dstStride,
-                                  .dstPitch = dstStride * 2 });
-            d->vk->vkCmdDispatch(cmd, (static_cast<uint32_t>(rowBytes) + 63) / 64,
-                                 (static_cast<uint32_t>(p.rows) + 3) / 4, 1);
-        }
-
-        // Pad: source plane -> padded field plane in the pad scratch.
-        d->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d->padPipe);
-        for (int plane = 0; plane < numPlanes; plane++) {
-            const PlaneSetup& p = d->planes[plane];
-            if (!p.process)
-                continue;
-            const VkDescriptorBufferInfo bufs[2] = {
-                { srcPlanes[plane].buffer, 0, VK_WHOLE_SIZE },
-                { padInfo.buffer, p.padOffset, p.padBytes },
-            };
-            pushDescriptors(bufs, 2);
-            pushPC(PushConstants{ .width = p.width,
-                                  .rows = p.rows,
-                                  .padStride = p.padStride,
-                                  .peak = 0,
-                                  .srcStride = static_cast<int>(vsapi->getStride(src, plane)) / bps,
-                                  .rowOff = d->dh ? 0 : parity,
-                                  .rowScale = d->dh ? 1 : 2,
-                                  .fp = fp,
-                                  .dstBase = 0,
-                                  .dstPitch = 0 });
-            d->vk->vkCmdDispatch(cmd, (static_cast<uint32_t>(p.padStride) + 15) / 16,
-                                 (static_cast<uint32_t>(p.padHeight) + 15) / 16, 1);
-        }
-
-        // Reset the per-plane counters and indirect dispatch arguments.
-        if (d->pscrn > 0) {
-            for (int plane = 0; plane < numPlanes; plane++) {
-                const PlaneSetup& p = d->planes[plane];
-                if (!p.process)
-                    continue;
-                d->vk->vkCmdFillBuffer(cmd, devInfo.buffer, p.cntOffset, 8, 0);     // predCount, groupsX
-                d->vk->vkCmdFillBuffer(cmd, devInfo.buffer, p.cntOffset + 8, 8, 1); // groupsY, groupsZ
-            }
-        }
-
-        // Pad writes and counter fills become visible to the network kernels.
-        cmdMemoryBarrier(d->vk, cmd,
-                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT,
-                         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
-                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                         VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
-
-        auto pushKernelDescriptors = [&](int plane) {
-            const PlaneSetup& p = d->planes[plane];
-            const bool hasList = d->pscrn > 0;
-            VkDescriptorBufferInfo bufs[BindCount];
-            bufs[BindPad] = { padInfo.buffer, p.padOffset, p.padBytes };
-            bufs[BindDst] = { dstPlanes[plane].buffer, 0, VK_WHOLE_SIZE };
-            bufs[BindPsW] = { d->weightsInfo.buffer, d->psWOffset, d->psWBytes };
-            bufs[BindPdW] = { d->weightsInfo.buffer, d->pdWOffset, d->pdWBytes };
-            bufs[BindPdB] = { d->weightsInfo.buffer, d->pdBOffset, d->pdBBytes };
-            bufs[BindList] = { devInfo.buffer, hasList ? p.listOffset : 0, hasList ? p.listBytes : VK_WHOLE_SIZE };
-            bufs[BindCnt] = { devInfo.buffer, hasList ? p.cntOffset : 0, hasList ? 16 : VK_WHOLE_SIZE };
-            pushDescriptors(bufs, BindCount);
-        };
-
-        // Interpolated rows go straight into the destination plane, strided:
-        // row r of the field lands at output row !parity + 2r.
-        auto kernelPC = [&](int plane) {
-            const PlaneSetup& p = d->planes[plane];
-            const int dstStrideElems = static_cast<int>(vsapi->getStride(dst, plane)) / bps;
-            pushPC(PushConstants{ .width = p.width,
-                                  .rows = p.rows,
-                                  .padStride = p.padStride,
-                                  .peak = d->peak,
-                                  .srcStride = 0,
-                                  .rowOff = 0,
-                                  .rowScale = 0,
-                                  .fp = 0,
-                                  .dstBase = !parity * dstStrideElems,
-                                  .dstPitch = 2 * dstStrideElems });
-        };
-
-        if (d->pscrn > 0) {
-            d->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d->prescreenPipe);
-            for (int plane = 0; plane < numPlanes; plane++) {
-                const PlaneSetup& p = d->planes[plane];
-                if (!p.process)
-                    continue;
-                pushKernelDescriptors(plane);
-                kernelPC(plane);
-                const int pixPerThread = (d->pscrn == 1) ? 1 : 4;
-                const uint32_t threads = static_cast<uint32_t>(p.rows) *
-                    ((static_cast<uint32_t>(p.width) + pixPerThread - 1) / pixPerThread);
-                d->vk->vkCmdDispatch(cmd, (threads + d->prescreenWG - 1) / d->prescreenWG, 1, 1);
-            }
-        }
-
-        if (d->pscrn > 0)
-            cmdMemoryBarrier(d->vk, cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                             VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
-                             VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT);
-
-        d->vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d->predictPipe);
-        for (int plane = 0; plane < numPlanes; plane++) {
-            const PlaneSetup& p = d->planes[plane];
-            if (!p.process)
-                continue;
-            pushKernelDescriptors(plane);
-            kernelPC(plane);
-            if (d->pscrn > 0) {
-                d->vk->vkCmdDispatchIndirect(cmd, devInfo.buffer, p.cntOffset + 4);
-            } else {
-                const uint32_t pixels = static_cast<uint32_t>(p.width) * static_cast<uint32_t>(p.rows);
-                d->vk->vkCmdDispatch(cmd, (pixels + d->pixelsPerPredictWG - 1) / d->pixelsPerPredictWG, 1, 1);
-            }
-        }
-
-        // The source planes' producers become device side waits and the frame
-        // stays alive until this submission completes; the planes written get
-        // this submission's producer pair published on them at submit.
-        d->vkapi->gpuExecReadsFrame(ctx, src);
-        for (int plane = 0; plane < numPlanes; plane++)
-            if (d->planes[plane].process)
-                d->vkapi->gpuExecWritesPlane(ctx, dst, plane);
-
-        if (d->vkapi->gpuExecSubmit(ctx, verr, sizeof(verr))) {
-            ctx = nullptr; // consumed either way
-            throw std::runtime_error(verr);
-        }
-        ctx = nullptr;
-    } catch (const std::exception& e) {
-        if (ctx)
-            d->vkapi->gpuExecAbandon(ctx);
-        vsapi->setFilterError(("NNEDI3VK: "s + e.what()).c_str(), frameCtx);
-        vsapi->freeFrame(src);
-        vsapi->freeFrame(dst);
-        return nullptr;
-    }
-
-    // The pool holds its own reference for as long as the GPU needs the frame,
-    // so this one is released the ordinary way.
-    vsapi->freeFrame(src);
-
-    VSMap* props = vsapi->getFramePropertiesRW(dst);
-    vsapi->mapSetInt(props, "_FieldBased", VSC_FIELD_PROGRESSIVE, maReplace);
-    vsapi->mapDeleteKey(props, "_Field");
-
-    if (d->field > 1) {
-        int errNum, errDen;
-        int64_t durationNum = vsapi->mapGetInt(props, "_DurationNum", 0, &errNum);
-        int64_t durationDen = vsapi->mapGetInt(props, "_DurationDen", 0, &errDen);
-        if (!errNum && !errDen) {
-            vsh::muldivRational(&durationNum, &durationDen, 1, 2);
-            vsapi->mapSetInt(props, "_DurationNum", durationNum, maReplace);
-            vsapi->mapSetInt(props, "_DurationDen", durationDen, maReplace);
-        }
-    }
-
-    return dst;
-}
-
-void VS_CC nnedi3Free(void* instanceData, [[maybe_unused]] VSCore* core, const VSAPI* vsapi) {
-    auto d = static_cast<NNEDI3Data*>(instanceData);
-    d->destroy();
-    vsapi->freeNode(d->node);
-    delete d;
-}
-
-//////////////////////////////////////////
-// Creation / Vulkan object setup
-
-// Uploads the prepared weight blobs into a device-local buffer via a one-shot
-// staging copy on the core's compute queue.
-void uploadWeights(NNEDI3Data* d, VSCore* core, const void* data, VkDeviceSize bytes) {
-    char verr[512] = { 0 };
-
-    d->weightsBuf = d->vkapi->createGPUBuffer(core, bytes,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, &d->weightsInfo, verr, sizeof(verr));
-    if (!d->weightsBuf)
-        throw std::runtime_error("weights buffer: "s + verr);
-
-    VSVulkanBufferInfo stagingInfo{};
-    VSGPUBuffer* staging = d->vkapi->createGPUBuffer(core, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-        VK_MEMORY_PROPERTY_HOST_CACHED_BIT, &stagingInfo, verr, sizeof(verr));
-    if (!staging)
-        throw std::runtime_error("weights staging buffer: "s + verr);
-
-    try {
-        std::memcpy(stagingInfo.mapped, data, bytes);
-
-        // One shot: record the copy in a pool context, submit, and drain, since
-        // everything recorded afterwards reads these weights.
-        VSGPUExecContext* ctx = d->vkapi->gpuExecAcquire(d->execPool, verr, sizeof(verr));
-        if (!ctx)
-            throw std::runtime_error("weights upload: "s + verr);
-        const VkBufferCopy2 region{ .sType = VK_STRUCTURE_TYPE_BUFFER_COPY_2, .size = bytes };
-        const VkCopyBufferInfo2 copy{ .sType = VK_STRUCTURE_TYPE_COPY_BUFFER_INFO_2,
-                                      .srcBuffer = stagingInfo.buffer,
-                                      .dstBuffer = d->weightsInfo.buffer,
-                                      .regionCount = 1,
-                                      .pRegions = &region };
-        d->vk->vkCmdCopyBuffer2(d->vkapi->gpuExecCommandBuffer(ctx), &copy);
-        if (d->vkapi->gpuExecSubmit(ctx, verr, sizeof(verr)))
-            throw std::runtime_error("weights upload: "s + verr);
-        if (d->vkapi->gpuExecPoolWaitIdle(d->execPool, verr, sizeof(verr)))
-            throw std::runtime_error("weights upload: "s + verr);
-    } catch (...) {
-        d->vkapi->destroyGPUBuffer(staging);
-        throw;
-    }
-
-    d->vkapi->destroyGPUBuffer(staging);
-}
-
-void setupVulkanObjects(NNEDI3Data* d, int32_t xdim, int32_t ydim, int32_t nns,
-                        uint32_t maxWGInvocations, uint32_t maxWGSizeX) {
-    const VkDevice device = d->h.device;
-    const int pixelType = d->pixelType;
-
-    {
-        const VkShaderModuleCreateInfo smci{ .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-                                             .codeSize = kSpv[0][pixelType].size,
-                                             .pCode = kSpv[0][pixelType].code };
-        VK_CHECK(d->vk->vkCreateShaderModule(device, &smci, nullptr, &d->padModule));
-    }
-    {
-        const VkShaderModuleCreateInfo smci{ .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-                                             .codeSize = sizeof(rowcopySpv),
-                                             .pCode = rowcopySpv };
-        VK_CHECK(d->vk->vkCreateShaderModule(device, &smci, nullptr, &d->rowcopyModule));
-    }
-    if (d->pscrn > 0) {
-        const VkShaderModuleCreateInfo smci{ .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-                                             .codeSize = kSpv[1][pixelType].size,
-                                             .pCode = kSpv[1][pixelType].code };
-        VK_CHECK(d->vk->vkCreateShaderModule(device, &smci, nullptr, &d->prescreenModule));
-    }
-    {
-        const VkShaderModuleCreateInfo smci{ .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-                                             .codeSize = kSpv[2][pixelType].size,
-                                             .pCode = kSpv[2][pixelType].code };
-        VK_CHECK(d->vk->vkCreateShaderModule(device, &smci, nullptr, &d->predictModule));
-    }
-
-    VkDescriptorSetLayoutBinding bindings[BindCount];
-    for (uint32_t i = 0; i < BindCount; i++)
-        bindings[i] = VkDescriptorSetLayoutBinding{ .binding = i,
-                                                    .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                                                    .descriptorCount = 1,
-                                                    .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT };
-    const VkDescriptorSetLayoutCreateInfo dslci{ .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-                                                 .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT,
-                                                 .bindingCount = BindCount,
-                                                 .pBindings = bindings };
-    VK_CHECK(d->vk->vkCreateDescriptorSetLayout(device, &dslci, nullptr, &d->dsl));
-
-    const VkPushConstantRange pcr{ .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT, .offset = 0, .size = sizeof(PushConstants) };
-    const VkPipelineLayoutCreateInfo plci{ .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-                                           .setLayoutCount = 1,
-                                           .pSetLayouts = &d->dsl,
-                                           .pushConstantRangeCount = 1,
-                                           .pPushConstantRanges = &pcr };
-    VK_CHECK(d->vk->vkCreatePipelineLayout(device, &plci, nullptr, &d->pipelineLayout));
-
-    static constexpr VkSpecializationMapEntry specEntries[] = {
-        { 0, offsetof(SpecData, wgSize), sizeof(uint32_t) },
-        { 1, offsetof(SpecData, pscrn), sizeof(int32_t) },
-        { 2, offsetof(SpecData, xdim), sizeof(int32_t) },
-        { 3, offsetof(SpecData, ydim), sizeof(int32_t) },
-        { 4, offsetof(SpecData, nns), sizeof(int32_t) },
-        { 5, offsetof(SpecData, qual), sizeof(int32_t) },
-        { 6, offsetof(SpecData, sgSize), sizeof(int32_t) },
-        { 7, offsetof(SpecData, subgroups), sizeof(int32_t) },
-        { 8, offsetof(SpecData, useList), sizeof(VkBool32) },
-    };
-    constexpr uint32_t specEntryCount = static_cast<uint32_t>(std::size(specEntries));
-
-    const uint32_t sgSize = d->subgroupSize;
-    const uint32_t maxWG = std::min(maxWGInvocations, maxWGSizeX);
-    d->prescreenWG = std::min(128u, maxWG);
-
-    // Predict: PX pixels per subgroup (blocked GEMM).
-    const uint32_t gemvPPL = (static_cast<uint32_t>(nns) + sgSize - 1) / sgSize;
-    const uint32_t gemvFS = static_cast<uint32_t>(xdim * ydim);
-    // Must match PX in predict.comp.
-    const uint32_t gemvPX = (d->pixelType != 2 && gemvPPL <= 2 && gemvFS <= 128) ? 8 : 4;
-    const uint32_t subgroupsPerWG = std::max(1u, std::min(4u, maxWG / sgSize));
-    const uint32_t predictWG = sgSize * subgroupsPerWG;
-    d->pixelsPerPredictWG = subgroupsPerWG * gemvPX;
-
-    // Note: constant_id 7 differs per kernel — the prescreen kernel uses it
-    // as "pixels per predict workgroup" (indirect dispatch sizing), the GEMV
-    // predict kernel as its actual subgroup count.
-    const SpecData spec{ .wgSize = 0, // filled in per pipeline
-                         .pscrn = d->pscrn,
-                         .xdim = xdim,
-                         .ydim = ydim,
-                         .nns = nns,
-                         .qual = d->qual,
-                         .sgSize = static_cast<int32_t>(sgSize),
-                         .subgroups = 0, // filled in per pipeline
-                         .useList = d->pscrn > 0 ? VK_TRUE : VK_FALSE };
-
-    auto makePipeline = [&](VkShaderModule module, const SpecData& pspec, bool pinSubgroups, VkPipeline* out) {
-        const VkSpecializationInfo specInfo{ .mapEntryCount = specEntryCount,
-                                             .pMapEntries = specEntries,
-                                             .dataSize = sizeof(pspec),
-                                             .pData = &pspec };
-        const VkPipelineShaderStageRequiredSubgroupSizeCreateInfo reqSg{
-            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO,
-            .requiredSubgroupSize = sgSize };
-        const VkComputePipelineCreateInfo cpci{
-            .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-            .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                       .pNext = (pinSubgroups && d->canRequireSubgroupSize) ? &reqSg : nullptr,
-                       .flags = pinSubgroups
-                                    ? VkPipelineShaderStageCreateFlags(VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT)
-                                    : 0,
-                       .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-                       .module = module,
-                       .pName = "main",
-                       .pSpecializationInfo = &specInfo },
-            .layout = d->pipelineLayout,
-        };
-        VK_CHECK(d->vk->vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpci, nullptr, out));
-    };
-
-    {
-        SpecData pspec = spec; // pad/rowcopy have fixed local sizes; spec constants unused
-        makePipeline(d->padModule, pspec, false, &d->padPipe);
-        makePipeline(d->rowcopyModule, pspec, false, &d->rowcopyPipe);
-    }
-    if (d->pscrn > 0) {
-        SpecData pspec = spec;
-        pspec.wgSize = d->prescreenWG;
-        pspec.subgroups = static_cast<int32_t>(d->pixelsPerPredictWG);
-        makePipeline(d->prescreenModule, pspec, false, &d->prescreenPipe);
-    }
-    {
-        // The GEMV kernel relies on subgroup-per-pixel mapping, so it pins
-        // the subgroup size and requires full subgroups (both core features
-        // the VapourSynth device always enables).
-        SpecData pspec = spec;
-        pspec.wgSize = predictWG;
-        pspec.subgroups = static_cast<int32_t>(subgroupsPerWG);
-        makePipeline(d->predictModule, pspec, true, &d->predictPipe);
-    }
-
-}
+// Creation
 
 int getIntDef(const VSAPI* vsapi, const VSMap* in, const char* name, int def) {
     int err;
@@ -1010,21 +425,19 @@ int getIntDef(const VSAPI* vsapi, const VSMap* in, const char* name, int def) {
 }
 
 void VS_CC nnedi3Create(const VSMap* in, VSMap* out, [[maybe_unused]] void* userData, VSCore* core, const VSAPI* vsapi) {
-    auto d = std::make_unique<NNEDI3Data>();
+    VSNode* node = vsapi->mapGetNode(in, "clip", 0, nullptr);
     int err;
 
     try {
-        d->node = vsapi->mapGetNode(in, "clip", 0, nullptr);
-        d->vi = *vsapi->getVideoInfo(d->node);
+        VSVideoInfo vi = *vsapi->getVideoInfo(node);
 
-        if (!vsh::isConstantVideoFormat(&d->vi) ||
-            (d->vi.format.sampleType == stInteger && d->vi.format.bitsPerSample > 16) ||
-            (d->vi.format.sampleType == stFloat && d->vi.format.bitsPerSample != 16 && d->vi.format.bitsPerSample != 32))
+        if (!vsh::isConstantVideoFormat(&vi) ||
+            (vi.format.sampleType == stInteger && vi.format.bitsPerSample > 16) ||
+            (vi.format.sampleType == stFloat && vi.format.bitsPerSample != 16 && vi.format.bitsPerSample != 32))
             throw std::runtime_error("only constant format 8-16 bit integer and 16/32 bit float input supported");
 
-        d->field = vsapi->mapGetIntSaturated(in, "field", 0, nullptr);
-
-        d->dh = !!vsapi->mapGetInt(in, "dh", 0, &err);
+        const int field = vsapi->mapGetIntSaturated(in, "field", 0, nullptr);
+        const bool dh = !!vsapi->mapGetInt(in, "dh", 0, &err);
 
         const int numPlanes = vsapi->mapNumElements(in, "planes");
 
@@ -1035,7 +448,7 @@ void VS_CC nnedi3Create(const VSMap* in, VSMap* out, [[maybe_unused]] void* user
         for (int i = 0; i < numPlanes; i++) {
             const int plane = vsapi->mapGetIntSaturated(in, "planes", i, nullptr);
 
-            if (plane < 0 || plane >= d->vi.format.numPlanes)
+            if (plane < 0 || plane >= vi.format.numPlanes)
                 throw std::runtime_error("plane index out of range");
 
             if (process[plane])
@@ -1046,19 +459,19 @@ void VS_CC nnedi3Create(const VSMap* in, VSMap* out, [[maybe_unused]] void* user
 
         const int nsize = getIntDef(vsapi, in, "nsize", 6);
         const int nns = getIntDef(vsapi, in, "nns", 1);
-        d->qual = getIntDef(vsapi, in, "qual", 1);
+        const int qual = getIntDef(vsapi, in, "qual", 1);
         const int etype = getIntDef(vsapi, in, "etype", 0);
-        d->pscrn = getIntDef(vsapi, in, "pscrn", 2);
+        const int pscrn = getIntDef(vsapi, in, "pscrn", 2);
 
-        if (d->field < 0 || d->field > 3)
+        if (field < 0 || field > 3)
             throw std::runtime_error("field must be 0, 1, 2, or 3");
 
-        if (!d->dh)
-            for (int plane = 0; plane < d->vi.format.numPlanes; plane++)
-                if (process[plane] && ((d->vi.height >> (plane > 0 ? d->vi.format.subSamplingH : 0)) & 1))
+        if (!dh)
+            for (int plane = 0; plane < vi.format.numPlanes; plane++)
+                if (process[plane] && ((vi.height >> (plane > 0 ? vi.format.subSamplingH : 0)) & 1))
                     throw std::runtime_error("plane's height must be mod 2 when dh=False");
 
-        if (d->dh && d->field > 1)
+        if (dh && field > 1)
             throw std::runtime_error("field must be 0 or 1 when dh=True");
 
         if (nsize < 0 || nsize > 6)
@@ -1067,25 +480,25 @@ void VS_CC nnedi3Create(const VSMap* in, VSMap* out, [[maybe_unused]] void* user
         if (nns < 0 || nns > 4)
             throw std::runtime_error("nns must be between 0 and 4 (inclusive)");
 
-        if (d->qual < 1 || d->qual > 2)
+        if (qual < 1 || qual > 2)
             throw std::runtime_error("qual must be 1 or 2");
 
         if (etype < 0 || etype > 1)
             throw std::runtime_error("etype must be 0 or 1");
 
-        if (d->pscrn < 0 || d->pscrn > 4)
+        if (pscrn < 0 || pscrn > 4)
             throw std::runtime_error("pscrn must be between 0 and 4 (inclusive)");
 
-        if (d->field > 1) {
-            if (d->vi.numFrames > INT_MAX / 2)
+        if (field > 1) {
+            if (vi.numFrames > INT_MAX / 2)
                 throw std::runtime_error("resulting clip is too long");
-            d->vi.numFrames *= 2;
+            vi.numFrames *= 2;
 
-            vsh::muldivRational(&d->vi.fpsNum, &d->vi.fpsDen, 2, 1);
+            vsh::muldivRational(&vi.fpsNum, &vi.fpsDen, 2, 1);
         }
 
-        if (d->dh)
-            d->vi.height *= 2;
+        if (dh)
+            vi.height *= 2;
 
         // Load the nnedi3 weights that ship next to the plugin binary.
         PrescreenerOldCoefficients psOld;
@@ -1107,108 +520,101 @@ void VS_CC nnedi3Create(const VSMap* in, VSMap* out, [[maybe_unused]] void* user
             readNNEDI3Weights(fileData.data(), nsize, nns, etype, psOld, psNew, model);
         }
 
-        const bool isFloat = d->vi.format.sampleType == stFloat;
-        const double pixelHalf = isFloat ? 0.5 : static_cast<double>((1 << d->vi.format.bitsPerSample) - 1) / 2.0;
+        const bool isFloat = vi.format.sampleType == stFloat;
+        const double pixelHalf = isFloat ? 0.5 : static_cast<double>((1 << vi.format.bitsPerSample) - 1) / 2.0;
 
-        if (d->pscrn == 1)
+        if (pscrn == 1)
             subtractMean(psOld, pixelHalf);
-        else if (d->pscrn >= 2)
-            subtractMean(psNew[d->pscrn - 2], pixelHalf);
+        else if (pscrn >= 2)
+            subtractMean(psNew[pscrn - 2], pixelHalf);
         subtractMean(model);
 
-        if (d->vi.format.bytesPerSample == 1)
-            d->pixelType = 0;
-        else if (d->vi.format.bytesPerSample == 2 && !isFloat)
-            d->pixelType = 1;
-        else if (d->vi.format.bytesPerSample == 2)
-            d->pixelType = 2;
+        int pixelType;
+        if (vi.format.bytesPerSample == 1)
+            pixelType = 0;
+        else if (vi.format.bytesPerSample == 2 && !isFloat)
+            pixelType = 1;
+        else if (vi.format.bytesPerSample == 2)
+            pixelType = 2;
         else
-            d->pixelType = 3;
+            pixelType = 3;
 
-        d->peak = (1 << d->vi.format.bitsPerSample) - 1;
-
-        d->profile = envFlag("NNEDI3VK_PROFILE");
-
-        // The core's device, dispatch table and queue.
+        // Device geometry the specialization needs: subgroup size and control,
+        // workgroup limits, and the optional shaderFloat16. All reachable
+        // through the public handle/dispatch queries; the driver needs none of
+        // it, only the resulting Program fields.
         char verr[512] = { 0 };
-        d->vkapi = vsapi->getVulkanAPI(VSVULKAN_API_VERSION);
-        if (!d->vkapi)
+        const VSVULKANAPI* vkapi = vsapi->getVulkanAPI(VSVULKAN_API_VERSION);
+        if (!vkapi)
             throw std::runtime_error("Vulkan API not available in this core");
-        if (d->vkapi->getVulkanHandles(core, &d->h, verr, sizeof(verr)))
+        VSVulkanCoreHandles h{};
+        if (vkapi->getVulkanHandles(core, &h, verr, sizeof(verr)))
             throw std::runtime_error(verr);
-        d->vk = d->vkapi->getVulkanFunctions(core, verr, sizeof(verr));
-        if (!d->vk)
+        const VSVulkanFunctions* vk = vkapi->getVulkanFunctions(core, verr, sizeof(verr));
+        if (!vk)
             throw std::runtime_error(verr);
 
-        const VkDeviceQueueInfo2 queueInfo{ .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_INFO_2,
-                                            .queueFamilyIndex = d->h.computeQueueFamily,
-                                            .queueIndex = d->h.computeQueueIndex };
-        d->vk->vkGetDeviceQueue2(d->h.device, &queueInfo, &d->computeQueue);
-
-        // Subgroup geometry and limits from the physical device. The
-        // subgroup size control features are part of the core's required set,
-        // so pinning is only limited by the stage support property.
-        uint32_t maxWGInvocations, maxWGSizeX;
+        uint32_t subgroupSize, maxWGInvocations, maxWGSizeX;
+        bool canRequireSubgroupSize;
         {
             VkPhysicalDeviceVulkan13Properties props13{ .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES };
             VkPhysicalDeviceVulkan11Properties props11{ .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES,
                                                         .pNext = &props13 };
             VkPhysicalDeviceProperties2 props2{ .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
                                                 .pNext = &props11 };
-            d->vk->vkGetPhysicalDeviceProperties2(d->h.physicalDevice, &props2);
+            vk->vkGetPhysicalDeviceProperties2(h.physicalDevice, &props2);
 
             constexpr VkSubgroupFeatureFlags needed = VK_SUBGROUP_FEATURE_BASIC_BIT |
                 VK_SUBGROUP_FEATURE_ARITHMETIC_BIT | VK_SUBGROUP_FEATURE_BALLOT_BIT;
             if ((props11.subgroupSupportedOperations & needed) != needed)
                 throw std::runtime_error("device does not support subgroup arithmetic/ballot operations");
 
-            d->canRequireSubgroupSize = (props13.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0;
-            if (d->canRequireSubgroupSize)
-                d->subgroupSize = std::clamp(32u, props13.minSubgroupSize, props13.maxSubgroupSize);
+            canRequireSubgroupSize = (props13.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0;
+            if (canRequireSubgroupSize)
+                subgroupSize = std::clamp(32u, props13.minSubgroupSize, props13.maxSubgroupSize);
             else
-                d->subgroupSize = props11.subgroupSize;
+                subgroupSize = props11.subgroupSize;
 
-            d->timestampPeriod = props2.properties.limits.timestampPeriod;
             maxWGInvocations = props2.properties.limits.maxComputeWorkGroupInvocations;
             maxWGSizeX = props2.properties.limits.maxComputeWorkGroupSize[0];
         }
 
-        if (d->pixelType == 2) {
+        if (pixelType == 2) {
             // shaderFloat16 is optional on the core device, enabled when the
             // hardware has it; availability is the best signal reachable here.
             VkPhysicalDeviceVulkan12Features f12{ .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
             VkPhysicalDeviceFeatures2 f2{ .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &f12 };
-            d->vk->vkGetPhysicalDeviceFeatures2(d->h.physicalDevice, &f2);
+            vk->vkGetPhysicalDeviceFeatures2(h.physicalDevice, &f2);
             if (!f12.shaderFloat16)
                 throw std::runtime_error("FP16 input requires shaderFloat16 device support");
         }
 
-        // Plane layout / buffer sizes.
-        const int bps = d->vi.format.bytesPerSample;
-        VkDeviceSize padOff = 0, devOff = 0;
-        for (int plane = 0; plane < d->vi.format.numPlanes; plane++) {
-            PlaneSetup& p = d->planes[plane];
-            p.process = process[plane];
-            p.width = d->vi.width >> (plane > 0 ? d->vi.format.subSamplingW : 0);
-            p.height = d->vi.height >> (plane > 0 ? d->vi.format.subSamplingH : 0);
-            if (!p.process)
+        // Plane geometry and the derived scratch sizes.
+        auto st = std::make_shared<NNEDI3State>();
+        st->bps = vi.format.bytesPerSample;
+        st->peak = isFloat ? 0 : (1 << vi.format.bitsPerSample) - 1;
+        st->field = field;
+        st->pscrn = pscrn;
+        st->dh = dh;
+
+        VkDeviceSize maxPadBytes = 0, maxListBytes = 0;
+        for (int plane = 0; plane < vi.format.numPlanes; plane++) {
+            st->process[plane] = process[plane];
+            st->width[plane] = vi.width >> (plane > 0 ? vi.format.subSamplingW : 0);
+            const int height = vi.height >> (plane > 0 ? vi.format.subSamplingH : 0);
+            st->outHeight[plane] = height;
+            if (!process[plane])
                 continue;
 
-            p.rows = p.height / 2;
-            p.padStride = (p.width + MARGIN_H * 2 + 15) & ~15;
-            p.padHeight = p.rows + MARGIN_V * 2;
+            st->rows[plane] = height / 2;
+            st->padStride[plane] = (st->width[plane] + MARGIN_H * 2 + 15) & ~15;
+            st->padHeight[plane] = st->rows[plane] + MARGIN_V * 2;
 
-            p.padBytes = static_cast<VkDeviceSize>(p.padStride) * p.padHeight * bps;
-            p.padOffset = suballoc(padOff, p.padBytes);
-
-            if (d->pscrn > 0) {
-                p.listBytes = static_cast<VkDeviceSize>(p.width) * p.rows * sizeof(uint32_t);
-                p.listOffset = suballoc(devOff, p.listBytes);
-                p.cntOffset = suballoc(devOff, 16);
-            }
+            maxPadBytes = std::max(maxPadBytes,
+                static_cast<VkDeviceSize>(st->padStride[plane]) * st->padHeight[plane] * st->bps);
+            maxListBytes = std::max(maxListBytes,
+                static_cast<VkDeviceSize>(st->width[plane]) * st->rows[plane] * sizeof(uint32_t));
         }
-        d->padSize = std::max(padOff, BUF_ALIGN);
-        d->devbufSize = std::max(devOff, BUF_ALIGN);
 
         // Build the weight blobs.
         //
@@ -1216,7 +622,7 @@ void VS_CC nnedi3Create(const VSMap* in, VSMap* out, [[maybe_unused]] void* user
         // with the layer-0 kernel transposed to [k][4] so the kernel fetches
         // all four neurons' weights for a window element in one vec4 load.
         std::vector<float> psBlob;
-        if (d->pscrn == 1) {
+        if (pscrn == 1) {
             psBlob.resize(sizeof(psOld) / sizeof(float));
             const PrescreenerOldCoefficients& ps = psOld;
             float* p = psBlob.data();
@@ -1224,9 +630,9 @@ void VS_CC nnedi3Create(const VSMap* in, VSMap* out, [[maybe_unused]] void* user
                 for (unsigned n = 0; n < 4; n++)
                     *p++ = ps.kernel_l0[n][k];
             std::memcpy(p, ps.bias_l0, sizeof(psOld) - sizeof(ps.kernel_l0));
-        } else if (d->pscrn >= 2) {
+        } else if (pscrn >= 2) {
             psBlob.resize(sizeof(psNew[0]) / sizeof(float));
-            const PrescreenerNewCoefficients& ps = psNew[d->pscrn - 2];
+            const PrescreenerNewCoefficients& ps = psNew[pscrn - 2];
             float* p = psBlob.data();
             for (unsigned k = 0; k < 64; k++)
                 for (unsigned n = 0; n < 4; n++)
@@ -1240,7 +646,7 @@ void VS_CC nnedi3Create(const VSMap* in, VSMap* out, [[maybe_unused]] void* user
         // bias/rowsum pairs; see predict.comp for the exact layouts.
         const unsigned fs = model.xdim * model.ydim;
         const unsigned N = model.nns;
-        const unsigned numQ = static_cast<unsigned>(d->qual);
+        const unsigned numQ = static_cast<unsigned>(qual);
 
         std::vector<float> pdBias(numQ * 4 * N);
         for (unsigned q = 0; q < numQ; q++) {
@@ -1265,7 +671,7 @@ void VS_CC nnedi3Create(const VSMap* in, VSMap* out, [[maybe_unused]] void* user
 
         std::vector<float> pdW32;
         std::vector<uint16_t> pdW16;
-        if (d->pixelType == 2) {
+        if (pixelType == 2) {
             pdW16.resize(static_cast<size_t>(numQ) * (fs / 2) * N * 4);
             for (unsigned q = 0; q < numQ; q++) {
                 const float* sm = q ? model.softmax_q2.data() : model.softmax_q1.data();
@@ -1293,48 +699,367 @@ void VS_CC nnedi3Create(const VSMap* in, VSMap* out, [[maybe_unused]] void* user
             }
         }
 
-        // Assemble the combined weights buffer.
-        const void* pdWData;
-        if (d->pixelType == 2) {
-            d->pdWBytes = pdW16.size() * sizeof(uint16_t);
-            pdWData = pdW16.data();
-        } else {
-            d->pdWBytes = pdW32.size() * sizeof(float);
-            pdWData = pdW32.data();
+        // Workgroup geometry, identical to the hand-recorded version.
+        const uint32_t sgSize = subgroupSize;
+        const uint32_t maxWG = std::min(maxWGInvocations, maxWGSizeX);
+        const uint32_t prescreenWG = std::min(128u, maxWG);
+
+        // Predict: PX pixels per subgroup (blocked GEMM).
+        const uint32_t gemvPPL = (static_cast<uint32_t>(model.nns) + sgSize - 1) / sgSize;
+        const uint32_t gemvFS = fs;
+        // Must match PX in predict.comp.
+        const uint32_t gemvPX = (pixelType != 2 && gemvPPL <= 2 && gemvFS <= 128) ? 8 : 4;
+        const uint32_t subgroupsPerWG = std::max(1u, std::min(4u, maxWG / sgSize));
+        const uint32_t predictWG = sgSize * subgroupsPerWG;
+        const uint32_t pixelsPerPredictWG = subgroupsPerWG * gemvPX;
+
+        // Note: constant_id 7 is the GEMV predict kernel's subgroups per
+        // workgroup. The prescreen kernel declares it but no longer uses it
+        // (it fed the retired indirect dispatch sizing); it still receives
+        // "pixels per predict workgroup" for compatibility with the shared
+        // spec table.
+        const SpecData baseSpec{ .wgSize = 0,
+                                 .pscrn = pscrn,
+                                 .xdim = static_cast<int32_t>(model.xdim),
+                                 .ydim = static_cast<int32_t>(model.ydim),
+                                 .nns = static_cast<int32_t>(model.nns),
+                                 .qual = qual,
+                                 .sgSize = static_cast<int32_t>(sgSize),
+                                 .subgroups = 0,
+                                 .useList = pscrn > 0 ? VK_TRUE : VK_FALSE };
+        auto specialize = [&](vsgpu::Program& prog, uint32_t wgSize, int32_t subgroups) {
+            SpecData sd = baseSpec;
+            sd.wgSize = wgSize;
+            sd.subgroups = subgroups;
+            prog.specData.resize(sizeof(sd));
+            std::memcpy(prog.specData.data(), &sd, sizeof(sd));
+            prog.specEntries.assign(std::begin(specEntries), std::end(specEntries));
+        };
+
+        //////////////////////////////////////////
+        // The declaration itself.
+
+        vsgpu::FilterDesc desc;
+        desc.vi = vi;
+        desc.nodes.push_back(node);
+        // dh doubles the height, so an unprocessed plane cannot share the
+        // source plane the way the driver models unprocessed planes; it is
+        // produced too, by the zero fill pass below (the hand-recorded
+        // version left it unwritten, which was documented as undefined).
+        bool zeroPlanes = false;
+        for (int p = 0; p < 3; p++) {
+            desc.process[p] = process[p] || (dh && p < vi.format.numPlanes);
+            zeroPlanes = zeroPlanes || (desc.process[p] && !process[p]);
         }
-        d->psWBytes = psBlob.size() * sizeof(float);
-        d->pdBBytes = pdBias.size() * sizeof(float);
 
-        VkDeviceSize wOff = 0;
-        d->psWOffset = suballoc(wOff, d->psWBytes);
-        d->pdWOffset = suballoc(wOff, d->pdWBytes);
-        d->pdBOffset = suballoc(wOff, d->pdBBytes);
+        // Scratch: the padded field plane (wider than any output plane, so
+        // explicitly sized), the rejected-pixel list, and the 16 byte
+        // append-counter block.
+        desc.scratchCount = 3;
+        desc.scratchDefs = {
+            { maxPadBytes, 0 },
+            { pscrn > 0 ? maxListBytes : 16, 0 },
+            { 16, 0 },
+        };
+        constexpr int scratchPad = 0, scratchList = 1, scratchCnt = 2;
 
-        std::vector<uint8_t> weightsBlob(wOff);
-        std::memcpy(weightsBlob.data() + d->psWOffset, psBlob.data(), d->psWBytes);
-        std::memcpy(weightsBlob.data() + d->pdWOffset, pdWData, d->pdWBytes);
-        std::memcpy(weightsBlob.data() + d->pdBOffset, pdBias.data(), d->pdBBytes);
+        // Constants: prescreener weights, predictor weights, predictor
+        // bias/rowsums -- uploaded once by the driver, device local.
+        auto toBytes = [](const void* data, size_t bytes) {
+            std::vector<uint8_t> v(bytes);
+            std::memcpy(v.data(), data, bytes);
+            return v;
+        };
+        desc.constants.push_back(toBytes(psBlob.data(), psBlob.size() * sizeof(float)));
+        if (pixelType == 2)
+            desc.constants.push_back(toBytes(pdW16.data(), pdW16.size() * sizeof(uint16_t)));
+        else
+            desc.constants.push_back(toBytes(pdW32.data(), pdW32.size() * sizeof(float)));
+        desc.constants.push_back(toBytes(pdBias.data(), pdBias.size() * sizeof(float)));
+        constexpr int constPsW = 0, constPdW = 1, constPdB = 2;
 
-        // The pool comes first: the weights upload records through it, and every
-        // frame afterwards does too.
-        d->execPool = d->vkapi->createGPUExecPool(core, vqCompute, verr, sizeof(verr));
-        if (!d->execPool)
-            throw std::runtime_error("exec pool: "s + verr);
+        // Programs. localSizeX/Y are the dispatch divisors: for the network
+        // kernels that is pixels per workgroup, not the specialized thread
+        // count.
+        vsgpu::Program rowcopyProg;
+        rowcopyProg.spirv = rowcopySpv;
+        rowcopyProg.spirvBytes = sizeof(rowcopySpv);
+        rowcopyProg.storageBufferCount = 2;
+        rowcopyProg.pushConstantBytes = sizeof(PushConstants);
+        rowcopyProg.localSizeX = 64;
+        rowcopyProg.localSizeY = 4;
 
-        uploadWeights(d.get(), core, weightsBlob.data(), weightsBlob.size());
+        vsgpu::Program padProg;
+        padProg.spirv = kSpv[0][pixelType].code;
+        padProg.spirvBytes = kSpv[0][pixelType].size;
+        padProg.storageBufferCount = 2;
+        padProg.pushConstantBytes = sizeof(PushConstants);
+        padProg.localSizeX = 16;
+        padProg.localSizeY = 16;
 
-        setupVulkanObjects(d.get(), static_cast<int32_t>(model.xdim),
-                           static_cast<int32_t>(model.ydim), static_cast<int32_t>(model.nns),
-                           maxWGInvocations, maxWGSizeX);
+        vsgpu::Program predictProg;
+        predictProg.spirv = kSpv[2][pixelType].code;
+        predictProg.spirvBytes = kSpv[2][pixelType].size;
+        predictProg.storageBufferCount = 7;
+        predictProg.pushConstantBytes = sizeof(PushConstants);
+        predictProg.localSizeX = pixelsPerPredictWG;
+        predictProg.localSizeY = 1;
+        specialize(predictProg, predictWG, static_cast<int32_t>(subgroupsPerWG));
+        // The GEMV kernel relies on subgroup-per-pixel mapping, so it pins
+        // the subgroup size and requires full subgroups.
+        predictProg.requiredSubgroupSize = canRequireSubgroupSize ? sgSize : 0;
+        predictProg.requireFullSubgroups = true;
+
+        desc.programs.push_back(rowcopyProg);
+        desc.programs.push_back(padProg);
+        const int progRowcopy = 0, progPad = 1;
+        int progReset = -1, progPrescreen = -1, progZero = -1;
+        if (zeroPlanes) {
+            vsgpu::Program zeroProg;
+            zeroProg.glsl = zeroGlsl;
+            zeroProg.storageBufferCount = 1;
+            zeroProg.pushConstantBytes = sizeof(PushConstants);
+            zeroProg.localSizeX = 256;
+            zeroProg.localSizeY = 1;
+            desc.programs.push_back(zeroProg);
+            progZero = static_cast<int>(desc.programs.size()) - 1;
+        }
+        if (pscrn > 0) {
+            vsgpu::Program resetProg;
+            resetProg.glsl = resetGlsl;
+            resetProg.storageBufferCount = 1;
+            resetProg.pushConstantBytes = 0;
+            resetProg.localSizeX = 1;
+            resetProg.localSizeY = 1;
+
+            vsgpu::Program prescreenProg;
+            prescreenProg.spirv = kSpv[1][pixelType].code;
+            prescreenProg.spirvBytes = kSpv[1][pixelType].size;
+            prescreenProg.storageBufferCount = 7;
+            prescreenProg.pushConstantBytes = sizeof(PushConstants);
+            prescreenProg.localSizeX = prescreenWG;
+            prescreenProg.localSizeY = 1;
+            specialize(prescreenProg, prescreenWG, static_cast<int32_t>(pixelsPerPredictWG));
+
+            desc.programs.push_back(resetProg);
+            progReset = static_cast<int>(desc.programs.size()) - 1;
+            desc.programs.push_back(prescreenProg);
+            progPrescreen = static_cast<int>(desc.programs.size()) - 1;
+        }
+        desc.programs.push_back(predictProg);
+        const int progPredict = static_cast<int>(desc.programs.size()) - 1;
+
+        // Passes, in per-plane recording order. The network kernels bind the
+        // full seven-operand table of the shaders' shared layout; the entries
+        // a kernel does not declare are simply never read.
+        const std::vector<vsgpu::Operand> kernelBindings = {
+            vsgpu::Operand::scratch(scratchPad),
+            vsgpu::Operand::output(),
+            vsgpu::Operand::constant(constPsW),
+            vsgpu::Operand::constant(constPdW),
+            vsgpu::Operand::constant(constPdB),
+            vsgpu::Operand::scratch(scratchList),
+            vsgpu::Operand::scratch(scratchCnt),
+        };
+
+        // The interpolation passes run only for the planes the user named;
+        // dh's zero filled planes are covered by their own pass instead.
+        auto gatePlanes = [&process](vsgpu::Pass& pass) {
+            for (int p = 0; p < 3; p++)
+                pass.planes[p] = process[p];
+        };
+
+        if (zeroPlanes) {
+            vsgpu::Pass pass;
+            pass.program = progZero;
+            pass.bindings = { vsgpu::Operand::output() };
+            // Writes planes nothing else touches, so it needs no ordering.
+            pass.independent = true;
+            for (int p = 0; p < 3; p++)
+                pass.planes[p] = desc.process[p] && !process[p];
+            pass.reshape = [st](vsgpu::PassInfo& info) {
+                info.width = info.strideElements[0] * static_cast<uint32_t>(st->bps) *
+                    static_cast<uint32_t>(st->outHeight[info.plane]) / 4u;
+                info.height = 1;
+            };
+            st->passZero = static_cast<int>(desc.passes.size());
+            desc.passes.push_back(std::move(pass));
+        }
+        {
+            vsgpu::Pass pass;
+            pass.program = progRowcopy;
+            pass.bindings = { vsgpu::Operand::source(), vsgpu::Operand::output() };
+            // Reads only the source plane and writes only the kept rows, which
+            // no other pass touches, so it needs no ordering against anything.
+            pass.independent = true;
+            gatePlanes(pass);
+            pass.reshape = [st](vsgpu::PassInfo& info) {
+                info.width = static_cast<uint32_t>(st->width[info.plane] * st->bps);
+                info.height = static_cast<uint32_t>(st->rows[info.plane]);
+            };
+            st->passRowcopy = static_cast<int>(desc.passes.size());
+            desc.passes.push_back(std::move(pass));
+        }
+        {
+            vsgpu::Pass pass;
+            pass.program = progPad;
+            pass.bindings = { vsgpu::Operand::source(), vsgpu::Operand::scratch(scratchPad) };
+            gatePlanes(pass);
+            pass.reshape = [st](vsgpu::PassInfo& info) {
+                info.width = static_cast<uint32_t>(st->padStride[info.plane]);
+                info.height = static_cast<uint32_t>(st->padHeight[info.plane]);
+            };
+            st->passPad = static_cast<int>(desc.passes.size());
+            desc.passes.push_back(std::move(pass));
+        }
+        if (pscrn > 0) {
+            {
+                vsgpu::Pass pass;
+                pass.program = progReset;
+                pass.bindings = { vsgpu::Operand::scratch(scratchCnt) };
+                gatePlanes(pass);
+                pass.reshape = [](vsgpu::PassInfo& info) { info.width = info.height = 1; };
+                desc.passes.push_back(std::move(pass));
+            }
+            {
+                vsgpu::Pass pass;
+                pass.program = progPrescreen;
+                pass.bindings = kernelBindings;
+                gatePlanes(pass);
+                pass.reshape = [st](vsgpu::PassInfo& info) {
+                    const int pixPerThread = (st->pscrn == 1) ? 1 : 4;
+                    info.width = static_cast<uint32_t>(st->rows[info.plane]) *
+                        ((static_cast<uint32_t>(st->width[info.plane]) + pixPerThread - 1) / pixPerThread);
+                    info.height = 1;
+                };
+                st->passPrescreen = static_cast<int>(desc.passes.size());
+                desc.passes.push_back(std::move(pass));
+            }
+        }
+        {
+            vsgpu::Pass pass;
+            pass.program = progPredict;
+            pass.bindings = kernelBindings;
+            gatePlanes(pass);
+            // Dispatched over the worst case, every interpolated pixel. With a
+            // prescreener the kernel bounds itself by the compacted count
+            // (predCount), so the workgroups past the list retire on one
+            // uniform load; without one the same expression IS the exact
+            // grid. Earlier versions read the grid from the counter block via
+            // vkCmdDispatchIndirect instead -- ceil(count / pixels per
+            // workgroup) -- with the same kernel-side guard doing the real
+            // bounding either way.
+            pass.reshape = [st](vsgpu::PassInfo& info) {
+                info.width = static_cast<uint32_t>(st->width[info.plane]) *
+                    static_cast<uint32_t>(st->rows[info.plane]);
+                info.height = 1;
+            };
+            st->passPredict = static_cast<int>(desc.passes.size());
+            desc.passes.push_back(std::move(pass));
+        }
+
+        // Source field parity, mirroring vsznedi3's get_src_parity exactly.
+        // parity == 1 means the source is (treated as) the bottom field.
+        desc.frameParamCount = 1;
+        desc.prepareFrame = [st](int n, const VSFrame* const* sources, [[maybe_unused]] int numSources,
+                                 const VSAPI* vsapi, uint32_t* params, [[maybe_unused]] std::string& error) {
+            const VSMap* srcProps = vsapi->getFramePropertiesRO(sources[0]);
+            const int defaultParity = (st->field == 0 || st->field == 2) ? 1 : 0;
+            int parity;
+            int perr;
+            if (st->dh) {
+                const int fieldProp = vsapi->mapGetIntSaturated(srcProps, "_Field", 0, &perr);
+                parity = perr ? defaultParity : fieldProp;
+            } else if (st->field > 1) {
+                const int fieldBased = vsapi->mapGetIntSaturated(srcProps, "_FieldBased", 0, &perr);
+                parity = fieldBased == VSC_FIELD_BOTTOM ? 1 : fieldBased == VSC_FIELD_TOP ? 0 : defaultParity;
+                if (n % 2)
+                    parity = !parity;
+            } else {
+                parity = st->field == 0 ? 1 : 0;
+            }
+            params[0] = static_cast<uint32_t>(!!parity);
+            return true;
+        };
+
+        // field > 1 doubles the output frame rate.
+        if (field > 1)
+            desc.mapFrame = [](int n, [[maybe_unused]] int clip, int frameOffset) { return n / 2 + frameOffset; };
+
+        desc.fillPush = [st](const vsgpu::PassInfo& info, void* push) {
+            const int p = info.plane;
+            const int parity = static_cast<int>(info.frameParams[0]);
+            PushConstants pc{};
+            if (info.pass == st->passZero) {
+                // Word count of the whole plane; matches the reshape above.
+                pc.width = static_cast<int32_t>(info.strideElements[0]) * st->bps * st->outHeight[p] / 4;
+            } else if (info.pass == st->passRowcopy) {
+                // Byte addressed: every field of this kernel's push block is
+                // in bytes, and source row r of the kept field maps to output
+                // row parity + 2r (or 1:1 when dh).
+                const int srcStrideB = static_cast<int>(info.strideElements[0]) * st->bps;
+                const int dstStrideB = static_cast<int>(info.strideElements[1]) * st->bps;
+                pc.width = st->width[p] * st->bps;
+                pc.rows = st->rows[p];
+                pc.rowOff = st->dh ? 0 : parity * srcStrideB;
+                pc.rowScale = srcStrideB * (st->dh ? 1 : 2);
+                pc.dstBase = parity * dstStrideB;
+                pc.dstPitch = dstStrideB * 2;
+            } else if (info.pass == st->passPad) {
+                pc.width = st->width[p];
+                pc.rows = st->rows[p];
+                pc.padStride = st->padStride[p];
+                pc.srcStride = static_cast<int>(info.strideElements[0]);
+                pc.rowOff = st->dh ? 0 : parity;
+                pc.rowScale = st->dh ? 1 : 2;
+                pc.fp = !parity; // znedi3 PadFilter parity
+            } else {
+                // prescreen and predict: interpolated rows go straight into
+                // the destination plane, strided; row r of the field lands at
+                // output row !parity + 2r.
+                const int dstStrideElems = static_cast<int>(info.strideElements[1]);
+                pc.width = st->width[p];
+                pc.rows = st->rows[p];
+                pc.padStride = st->padStride[p];
+                pc.peak = st->peak;
+                pc.dstBase = !parity * dstStrideElems;
+                pc.dstPitch = 2 * dstStrideElems;
+            }
+            std::memcpy(push, &pc, sizeof(pc));
+        };
+
+        desc.finishFrame = [st](int, VSFrame* dst, const VSFrame* const*, int, const uint32_t*,
+                                [[maybe_unused]] VSCore* core, const VSAPI* vsapi) {
+            VSMap* props = vsapi->getFramePropertiesRW(dst);
+            vsapi->mapSetInt(props, "_FieldBased", VSC_FIELD_PROGRESSIVE, maReplace);
+            vsapi->mapDeleteKey(props, "_Field");
+
+            if (st->field > 1) {
+                int errNum, errDen;
+                int64_t durationNum = vsapi->mapGetInt(props, "_DurationNum", 0, &errNum);
+                int64_t durationDen = vsapi->mapGetInt(props, "_DurationDen", 0, &errDen);
+                if (!errNum && !errDen) {
+                    vsh::muldivRational(&durationNum, &durationDen, 1, 2);
+                    vsapi->mapSetInt(props, "_DurationNum", durationNum, maReplace);
+                    vsapi->mapSetInt(props, "_DurationDen", durationDen, maReplace);
+                }
+            }
+        };
+
+        const VSFilterDependency deps[] = { { node, field > 1 ? rpGeneral : rpStrictSpatial } };
+        std::string errorMessage;
+        VSNode* created = vsgpu::createFilter("NNEDI3", desc, deps, 1, core, vsapi, errorMessage);
+        if (!created) {
+            // createFilter consumed the nodes on failure too.
+            vsapi->mapSetError(out, ("NNEDI3VK: " + errorMessage).c_str());
+            return;
+        }
+        vsapi->mapConsumeNode(out, "clip", created, maAppend);
     } catch (const std::exception& e) {
         vsapi->mapSetError(out, ("NNEDI3VK: "s + e.what()).c_str());
-        nnedi3Free(d.release(), core, vsapi);
+        vsapi->freeNode(node);
         return;
     }
-
-    VSFilterDependency deps[] = { { d->node, d->field > 1 ? rpGeneral : rpStrictSpatial } };
-    vsapi->createVideoFilterEx(out, "NNEDI3", &d->vi, nnedi3GetFrame, nnedi3Free, fmParallel, ffGPUOutput, deps, 1, d.get(), core);
-    d.release();
 }
 
 //////////////////////////////////////////

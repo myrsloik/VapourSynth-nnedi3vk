@@ -4,8 +4,9 @@
 // Runs the prescreener network over every interpolated pixel, writes the
 // cheap cubic interpolation result for the pixels it accepts, and compacts
 // the indices of rejected pixels into a list for the predict kernel (one
-// subgroup-aggregated atomic per subgroup). It also maintains the indirect
-// dispatch size for the predict kernel via atomicMax.
+// subgroup-aggregated atomic per subgroup). The predict kernel is dispatched
+// over the worst case and bounds itself by predCount, so nothing here sizes
+// its grid.
 //
 // The prescreener decision must match the znedi3 C kernel bit-for-bit so the
 // predict kernel runs on exactly the same pixel set: all dot products
@@ -37,8 +38,9 @@ layout(binding = 2, scalar) readonly restrict buffer PsWeights { vec4 psW4[]; };
 // Pixel indices (r * width + x) the prescreener rejected.
 layout(binding = 5, scalar) writeonly restrict buffer ListBuf { uint listBuf[]; };
 
-// Cleared to {0, 0, 1, 1} before this kernel; groupsX/Y/Z feed
-// vkCmdDispatchIndirect for the predict kernel.
+// Cleared before this kernel. Only predCount is live; the trailing words are
+// the retired indirect dispatch arguments, kept so the 16 byte block layout
+// stays what every compiled kernel expects.
 layout(binding = 6, scalar) buffer CountBuf {
     uint predCount;
     uint groupsX;
@@ -161,10 +163,8 @@ void main() {
     // offsets via an exclusive scan.
     const uint total = subgroupAdd(uint(cnt));
     uint base = 0u;
-    if (subgroupElect() && total > 0u) {
+    if (subgroupElect() && total > 0u)
         base = atomicAdd(predCount, total);
-        atomicMax(groupsX, (base + total + uint(SUBGROUPS) - 1u) / uint(SUBGROUPS));
-    }
     base = subgroupBroadcastFirst(base);
     const uint off = base + subgroupExclusiveAdd(uint(cnt));
     for (int c = 0; c < cnt; c++)
