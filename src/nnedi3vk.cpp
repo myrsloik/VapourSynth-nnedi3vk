@@ -45,6 +45,7 @@
 #include <array>
 #include <cassert>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -67,67 +68,20 @@ using namespace std::string_literals;
 constexpr int MARGIN_H = 24;
 constexpr int MARGIN_V = 3;
 
-const uint32_t padU8Spv[] = {
-#include "pad_u8.h"
-};
-const uint32_t padU16Spv[] = {
-#include "pad_u16.h"
-};
-const uint32_t padF16Spv[] = {
-#include "pad_f16.h"
-};
-const uint32_t padF32Spv[] = {
-#include "pad_f32.h"
-};
-const uint32_t prescreenU8Spv[] = {
-#include "prescreen_u8.h"
-};
-const uint32_t prescreenU16Spv[] = {
-#include "prescreen_u16.h"
-};
-const uint32_t prescreenF16Spv[] = {
-#include "prescreen_f16.h"
-};
-const uint32_t prescreenF32Spv[] = {
-#include "prescreen_f32.h"
-};
-const uint32_t predictU8Spv[] = {
-#include "predict_u8.h"
-};
-const uint32_t predictU16Spv[] = {
-#include "predict_u16.h"
-};
-const uint32_t predictF16Spv[] = {
-#include "predict_f16.h"
-};
-const uint32_t predictF32Spv[] = {
-#include "predict_f32.h"
-};
-// Byte addressed, so one variant serves every pixel type.
-const uint32_t rowcopySpv[] = {
-#include "rowcopy.h"
-};
+#include "shadersources.h"
 
-struct SpvBlob {
-    const uint32_t* code;
-    size_t size;
-};
+// One kernel's source, ready for the core's compiler: the version directive the generator
+// stripped, then the pixel type the kernel specialises on, then the body. The define has to sit
+// here rather than in the file because GLSL requires #version first, and the core's compiler
+// takes a single string with no include handler -- see embed_shaders.py, which resolved the
+// common.glsl include at build time for the same reason.
+std::string shaderSource(const char *body, int pixelType) {
+    return "#version 460\n#define PIXEL_TYPE " + std::to_string(pixelType) + "\n" + body;
+}
 
-// Indexed [kernel][pixelType]; kernels: 0 = pad, 1 = prescreen, 2 = predict.
-constexpr SpvBlob kSpv[3][4] = {
-    { { padU8Spv, sizeof(padU8Spv) },
-      { padU16Spv, sizeof(padU16Spv) },
-      { padF16Spv, sizeof(padF16Spv) },
-      { padF32Spv, sizeof(padF32Spv) } },
-    { { prescreenU8Spv, sizeof(prescreenU8Spv) },
-      { prescreenU16Spv, sizeof(prescreenU16Spv) },
-      { prescreenF16Spv, sizeof(prescreenF16Spv) },
-      { prescreenF32Spv, sizeof(prescreenF32Spv) } },
-    { { predictU8Spv, sizeof(predictU8Spv) },
-      { predictU16Spv, sizeof(predictU16Spv) },
-      { predictF16Spv, sizeof(predictF16Spv) },
-      { predictF32Spv, sizeof(predictF32Spv) } },
-};
+// Indexed [kernel][pixelType]; kernels: 0 = pad, 1 = prescreen, 2 = predict. The sources are
+// pixel type agnostic, the define is what specialises them, so one row is one kernel repeated.
+constexpr const char *kKernelSrc[3] = { kPadSrc, kPrescreenSrc, kPredictSrc };
 
 // Round-to-nearest-even float32 -> float16 conversion.
 uint16_t floatToHalf(float f) {
@@ -410,6 +364,9 @@ struct NNEDI3State {
     int outHeight[3] = {}; // full output plane height, set for every plane
     int bps = 0, peak = 0;
     int field = 0, pscrn = 0;
+    /* Whether the matrix units are reachable for the predict GEMM; decided once at
+       creation from the core's capability plus the device's advertised shapes. */
+    bool coopMat = false;
     bool dh = false;
     // Pass indices in the declared pass list, -1 when absent.
     int passRowcopy = -1, passPad = -1, passPrescreen = -1, passPredict = -1, passZero = -1;
@@ -422,6 +379,15 @@ int getIntDef(const VSAPI* vsapi, const VSMap* in, const char* name, int def) {
     int err;
     int v = vsapi->mapGetIntSaturated(in, name, 0, &err);
     return err ? def : v;
+}
+
+// Optional flags that need to tell "left alone" apart from "explicitly off": -1 unset, 0 false,
+// 1 true. Unset selects automatically, and an explicit true is a demand that must be met or
+// refused rather than quietly downgraded.
+int getTriState(const VSAPI* vsapi, const VSMap* in, const char* name) {
+    int err;
+    const int v = vsapi->mapGetIntSaturated(in, name, 0, &err);
+    return err ? -1 : (v ? 1 : 0);
 }
 
 void VS_CC nnedi3Create(const VSMap* in, VSMap* out, [[maybe_unused]] void* userData, VSCore* core, const VSAPI* vsapi) {
@@ -462,6 +428,10 @@ void VS_CC nnedi3Create(const VSMap* in, VSMap* out, [[maybe_unused]] void* user
         const int qual = getIntDef(vsapi, in, "qual", 1);
         const int etype = getIntDef(vsapi, in, "etype", 0);
         const int pscrn = getIntDef(vsapi, in, "pscrn", 2);
+        // Unset picks whatever the device can do; True demands the matrix path and errors if it
+        // cannot be had; False pins the subgroup FMA kernel. Worth setting explicitly: on a
+        // device that only emulates cooperative matrix the automatic choice is a slowdown.
+        const int coopMat = getTriState(vsapi, in, "coop_mat");
 
         if (field < 0 || field > 3)
             throw std::runtime_error("field must be 0, 1, 2, or 3");
@@ -544,7 +514,7 @@ void VS_CC nnedi3Create(const VSMap* in, VSMap* out, [[maybe_unused]] void* user
         // through the public handle/dispatch queries; the driver needs none of
         // it, only the resulting Program fields.
         char verr[512] = { 0 };
-        const VSVULKANAPI* vkapi = vsapi->getVulkanAPI(VSVULKAN_API_VERSION);
+        const VSVULKANAPI* vkapi = vsapi->getVulkanAPI();
         if (!vkapi)
             throw std::runtime_error("Vulkan API not available in this core");
         VSVulkanCoreHandles h{};
@@ -589,8 +559,92 @@ void VS_CC nnedi3Create(const VSMap* in, VSMap* out, [[maybe_unused]] void* user
                 throw std::runtime_error("FP16 input requires shaderFloat16 device support");
         }
 
+        // Whether the predict GEMM may run on the matrix units. Three things must all hold and
+        // each is checked separately, because the failure modes are different:
+        //
+        //   1. the device supports VK_KHR_cooperative_matrix. The core's documented policy is to
+        //      enable the cooperative matrix extensions, with exactly the feature bits the
+        //      device reports, whenever the device offers them -- which is what makes the
+        //      physical device's own feature query authoritative for what the core device was
+        //      created with, the same contract shaderFloat16 relies on above.
+        //   2. the entry point that reports the shapes resolves. The core's function table is
+        //      deliberately core 1.4 only, so extension entry points like this one are fetched
+        //      through the handles' getInstanceProcAddr by whoever uses them; a null result
+        //      means the same as "no matrix path".
+        //   3. the device actually advertises the shape this kernel would be written against:
+        //      16x16x16 with fp16 inputs and fp32 accumulate, at subgroup scope. Advertising the
+        //      extension says nothing about which shapes exist, and a kernel compiled for a shape
+        //      the device does not have will not run.
+        // Each way this can fail keeps its own wording, because coop_mat=True reports it back to
+        // the user as the reason the request was refused, and "unavailable" on its own does not
+        // tell them whether to change the device, the core, or the argument.
+        bool coopMatUsable = false;
+        // Every branch below that leaves coopMatUsable false also assigns this, but it starts
+        // out valid rather than null: it is only ever read on a path that cannot be reached on
+        // hardware that supports the extension, so a future branch forgetting to set it would
+        // fail as a crash on someone else's machine and nowhere else.
+        const char* coopMatWhyNot = "cooperative matrix support was not detected";
+        {
+            VkPhysicalDeviceCooperativeMatrixFeaturesKHR cmFeat{ .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR };
+            VkPhysicalDeviceFeatures2 cmFeat2{ .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &cmFeat };
+            vk->vkGetPhysicalDeviceFeatures2(h.physicalDevice, &cmFeat2);
+            if (!cmFeat.cooperativeMatrix) {
+                coopMatWhyNot = "the device does not support VK_KHR_cooperative_matrix";
+            } else if (const auto coopMatProps = reinterpret_cast<PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR>(
+                           h.getInstanceProcAddr(h.instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR"));
+                       !coopMatProps) {
+                coopMatWhyNot = "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR could not be resolved";
+            } else {
+                uint32_t count = 0;
+                coopMatProps(h.physicalDevice, &count, nullptr);
+                std::vector<VkCooperativeMatrixPropertiesKHR> cfgs(count);
+                for (auto &c : cfgs)
+                    c.sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
+                if (count)
+                    coopMatProps(h.physicalDevice, &count, cfgs.data());
+                for (const auto &c : cfgs) {
+                    if (c.MSize == 16 && c.NSize == 16 && c.KSize == 16 &&
+                        c.AType == VK_COMPONENT_TYPE_FLOAT16_KHR && c.BType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                        c.CType == VK_COMPONENT_TYPE_FLOAT32_KHR && c.ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
+                        c.scope == VK_SCOPE_SUBGROUP_KHR) {
+                        coopMatUsable = true;
+                        break;
+                    }
+                }
+                if (!coopMatUsable)
+                    coopMatWhyNot = "the device does not advertise a 16x16x16 fp16->fp32 "
+                                    "cooperative matrix at subgroup scope";
+            }
+        }
+        // The coopmat kernel is fp16 in / fp32 accumulate, so it stands in for the fp16 predict
+        // path only; the other pixel types keep their own kernels.
+        if (coopMat > 0) {
+            if (!coopMatUsable)
+                throw std::runtime_error(std::string("coop_mat=True but the cooperative matrix "
+                                                     "predict path is unavailable: ") + coopMatWhyNot);
+            if (pixelType != 2)
+                throw std::runtime_error("coop_mat=True but the cooperative matrix predict path is "
+                                         "implemented for half float clips only; convert the clip to "
+                                         "a 16 bit float format or leave coop_mat unset");
+        }
+        const bool useCoopMat = coopMat != 0 && coopMatUsable && pixelType == 2;
+        {
+            // Each rejection names its own cause. A single shared "needs the fp16 path" string
+            // once covered an override too, which made a misconfigured benchmark look like a
+            // legitimate pixel format rejection for far longer than it should have.
+            const char* how =
+                useCoopMat       ? "the matrix units (16x16x16 fp16->fp32)"
+                : coopMat == 0     ? "subgroup FMA (cooperative matrix off via coop_mat=False)"
+                : !coopMatUsable   ? "subgroup FMA (no usable cooperative matrix support)"
+                                   : "subgroup FMA (cooperative matrix needs the half float pixel path)";
+            char msg[256];
+            snprintf(msg, sizeof(msg), "NNEDI3: predict GEMM on %s", how);
+            vsapi->logMessage(mtInformation, msg, core);
+        }
+
         // Plane geometry and the derived scratch sizes.
         auto st = std::make_shared<NNEDI3State>();
+        st->coopMat = useCoopMat;
         st->bps = vi.format.bytesPerSample;
         st->peak = isFloat ? 0 : (1 << vi.format.bitsPerSample) - 1;
         st->field = field;
@@ -671,7 +725,22 @@ void VS_CC nnedi3Create(const VSMap* in, VSMap* out, [[maybe_unused]] void* user
 
         std::vector<float> pdW32;
         std::vector<uint16_t> pdW16;
-        if (pixelType == 2) {
+        if (useCoopMat) {
+            // Row 2p is neuron p's softmax weights, row 2p+1 its elliott weights, each FS
+            // elements in the model's natural order. A 16 row tile is then 8 neurons with both
+            // activations already paired, which is what the shader's reduction consumes.
+            pdW16.resize(static_cast<size_t>(numQ) * 2 * N * fs);
+            for (unsigned q = 0; q < numQ; q++) {
+                const float* sm = q ? model.softmax_q2.data() : model.softmax_q1.data();
+                const float* el = q ? model.elliott_q2.data() : model.elliott_q1.data();
+                for (unsigned p = 0; p < N; p++)
+                    for (unsigned k = 0; k < fs; k++) {
+                        const size_t row = (static_cast<size_t>(q) * 2 * N + 2 * p) * fs;
+                        pdW16[row + k] = floatToHalf(sm[p * fs + k]);
+                        pdW16[row + fs + k] = floatToHalf(el[p * fs + k]);
+                    }
+            }
+        } else if (pixelType == 2) {
             pdW16.resize(static_cast<size_t>(numQ) * (fs / 2) * N * 4);
             for (unsigned q = 0; q < numQ; q++) {
                 const float* sm = q ? model.softmax_q2.data() : model.softmax_q1.data();
@@ -708,8 +777,19 @@ void VS_CC nnedi3Create(const VSMap* in, VSMap* out, [[maybe_unused]] void* user
         const uint32_t gemvPPL = (static_cast<uint32_t>(model.nns) + sgSize - 1) / sgSize;
         const uint32_t gemvFS = fs;
         // Must match PX in predict.comp.
-        const uint32_t gemvPX = (pixelType != 2 && gemvPPL <= 2 && gemvFS <= 128) ? 8 : 4;
-        const uint32_t subgroupsPerWG = std::max(1u, std::min(4u, maxWG / sgSize));
+        // The coopmat kernel pins PX to the tile's N dimension; predict.comp picks its own.
+        const uint32_t gemvPX = useCoopMat ? 16
+            : ((pixelType != 2 && gemvPPL <= 2 && gemvFS <= 128) ? 8 : 4);
+        // Subgroups per workgroup. The GEMV path wants four, but the coopmat path stages PX=16
+        // windows per subgroup against the GEMV path's 4, so four subgroups would hold four
+        // times the shared data -- 36KB at nsize=3, most of a 64KB block, which throttles
+        // occupancy badly. One coopmat subgroup already covers the same 16 pixels that four
+        // GEMV subgroups do, so a single subgroup workgroup keeps the shared footprint and the
+        // pixels per group both equal to the GEMV path's. Measured: at nsize=3 that is
+        // 56.5 ms/frame against 73.2 for four subgroups.
+        const uint32_t subgroupsPerWG = useCoopMat
+            ? 1u
+            : std::max(1u, std::min(4u, maxWG / sgSize));
         const uint32_t predictWG = sgSize * subgroupsPerWG;
         const uint32_t pixelsPerPredictWG = subgroupsPerWG * gemvPX;
 
@@ -782,24 +862,26 @@ void VS_CC nnedi3Create(const VSMap* in, VSMap* out, [[maybe_unused]] void* user
         // kernels that is pixels per workgroup, not the specialized thread
         // count.
         vsgpu::Program rowcopyProg;
-        rowcopyProg.spirv = rowcopySpv;
-        rowcopyProg.spirvBytes = sizeof(rowcopySpv);
+        // Byte addressed, so the pixel type it is specialised with is immaterial.
+        rowcopyProg.glsl = shaderSource(kRowcopySrc, 0);
         rowcopyProg.storageBufferCount = 2;
         rowcopyProg.pushConstantBytes = sizeof(PushConstants);
         rowcopyProg.localSizeX = 64;
         rowcopyProg.localSizeY = 4;
 
         vsgpu::Program padProg;
-        padProg.spirv = kSpv[0][pixelType].code;
-        padProg.spirvBytes = kSpv[0][pixelType].size;
+        padProg.glsl = shaderSource(kKernelSrc[0], pixelType);
         padProg.storageBufferCount = 2;
         padProg.pushConstantBytes = sizeof(PushConstants);
         padProg.localSizeX = 16;
         padProg.localSizeY = 16;
 
         vsgpu::Program predictProg;
-        predictProg.spirv = kSpv[2][pixelType].code;
-        predictProg.spirvBytes = kSpv[2][pixelType].size;
+        if (useCoopMat) {
+            predictProg.glsl = shaderSource(kPredictCmSrc, 2);
+        } else {
+            predictProg.glsl = shaderSource(kKernelSrc[2], pixelType);
+        }
         predictProg.storageBufferCount = 7;
         predictProg.pushConstantBytes = sizeof(PushConstants);
         predictProg.localSizeX = pixelsPerPredictWG;
@@ -833,8 +915,7 @@ void VS_CC nnedi3Create(const VSMap* in, VSMap* out, [[maybe_unused]] void* user
             resetProg.localSizeY = 1;
 
             vsgpu::Program prescreenProg;
-            prescreenProg.spirv = kSpv[1][pixelType].code;
-            prescreenProg.spirvBytes = kSpv[1][pixelType].size;
+            prescreenProg.glsl = shaderSource(kKernelSrc[1], pixelType);
             prescreenProg.storageBufferCount = 7;
             prescreenProg.pushConstantBytes = sizeof(PushConstants);
             prescreenProg.localSizeX = prescreenWG;
@@ -1083,7 +1164,8 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin* plugin, const VSPLUGINAPI
                              "nns:int:opt;"
                              "qual:int:opt;"
                              "etype:int:opt;"
-                             "pscrn:int:opt;",
+                             "pscrn:int:opt;"
+                             "coop_mat:int:opt;",
                              "clip:vnode:gpu;",
                              nnedi3Create,
                              nullptr,

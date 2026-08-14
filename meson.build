@@ -10,49 +10,30 @@ deps = [
     dependency('vulkan-headers'),
 ]
 
-glslc = find_program('glslc')
-
 incdir = include_directories(run_command('vapoursynth', 'get-include', check: true).stdout().strip())
 
 py = import('python').find_installation(pure: false)
 
-shaders = []
-
-foreach kernel : ['pad', 'prescreen', 'predict']
-    foreach pixel : [['u8', '0'], ['u16', '1'], ['f16', '2'], ['f32', '3']]
-        shaders += custom_target(
-            command: [
-                glslc,
-                '-DPIXEL_TYPE=' + pixel[1],
-                '-mfmt=num',
-                '-O',
-                '--target-env=vulkan1.4',
-                '-o',
-                '@OUTPUT@',
-                '@INPUT@',
-            ],
-            depend_files: files('src/shaders/common.glsl'),
-            input: files('src/shaders' / kernel + '.comp'),
-            output: kernel + '_' + pixel[0] + '.h',
-        )
-    endforeach
-endforeach
-
-# Byte addressed, one variant covers every pixel type.
-shaders += custom_target(
-    command: [
-        glslc,
-        '-DPIXEL_TYPE=0',
-        '-mfmt=num',
-        '-O',
-        '--target-env=vulkan1.4',
-        '-o',
-        '@OUTPUT@',
-        '@INPUT@',
-    ],
-    depend_files: files('src/shaders/common.glsl'),
-    input: files('src/shaders/rowcopy.comp'),
-    output: 'rowcopy.h',
+# The kernels ship as source and are compiled by the core at filter creation
+# (VSVULKANAPI::compileGPUShader, which caches per core by source text). This step only turns
+# them into string literals: it resolves the common.glsl include the core's compiler has no
+# handler for and strips #version so a #define PIXEL_TYPE preamble can precede the body. No
+# glslc, so building the plugin needs no shader toolchain at all -- the tradeoff is that the
+# core's compiler runs no optimizer, where glslc previously ran -O.
+shaders = custom_target(
+    command: [py, files('src/embed_shaders.py'), '@OUTPUT@', '@INPUT@'],
+    input: files(
+        'src/shaders/common.glsl',
+        'src/shaders/pad.comp',
+        'src/shaders/prescreen.comp',
+        'src/shaders/predict.comp',
+        # The cooperative matrix predict variant, selected at runtime in place of the fp16
+        # kernel when the device advertises the tile it is written against; see the shape probe
+        # in nnedi3vk.cpp.
+        'src/shaders/predict_cm.comp',
+        'src/shaders/rowcopy.comp',
+    ),
+    output: 'shadersources.h',
 )
 
 shared_module('nnedi3vk',

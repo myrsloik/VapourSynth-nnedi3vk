@@ -1,0 +1,214 @@
+#version 460
+// nnedi3vk predict kernel, cooperative matrix variant.
+//
+// Same mathematics as predict.comp, but the neuron GEMM runs on the matrix
+// units via VK_KHR_cooperative_matrix instead of hand-blocked subgroup FMA
+// chains. Selected at runtime only when the core enabled the extension AND the
+// device advertises 16x16x16 fp16->fp32 at subgroup scope; predict.comp stays
+// the fallback and is what runs everywhere else.
+//
+// The shapes line up without padding: the GEMM is [NNS x FS] * [FS x PX], NNS is
+// a power of two >= 16 and FS = XDIM*YDIM is a multiple of 16 for every
+// supported nsize. PX is pinned to 16 here (the tile's N dimension) rather than
+// the 4 or 8 predict.comp picks, which is the one real cost: sixteen windows
+// must be staged in shared memory instead of four or eight.
+//
+// Accumulating in fp32 is what makes this simpler than predict.comp's fp16
+// path. That kernel accumulates in half, so it centers the window before
+// scaling and adds the exact difference back per neuron from host computed
+// weight row sums. Here the accumulator is fp32, so the reference math (x/std,
+// weights applied directly) is used unchanged and the row sums go unread --
+// fewer moving parts and strictly better conditioned.
+//
+// The two weight matrices are interleaved by row -- row 2p is neuron p's softmax
+// weights, row 2p+1 its elliott weights -- so one 16 row tile yields 8 neurons
+// with their softmax and elliott activations already paired, which is exactly
+// what the wae5 reduction consumes. One matrix, one accumulator, one binding,
+// and no need to hold a whole NNS wide plane of activations to pair them up
+// later. Rows are otherwise the model's natural [neuron][element] order, so the
+// A tile is an ordinary row major load with stride FS and the host only
+// converts to fp16 and interleaves.
+//
+// Pixel px is owned by lane px throughout the reduction and the store, so every
+// lane keeps the moments for all PX pixels (they are computed cooperatively)
+// but only ever writes its own.
+
+#include "common.glsl"
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x_id = 0) in;
+
+layout(constant_id = 8) const bool USE_LIST = true;
+
+const int FS = XDIM * YDIM;   // window elements, always a multiple of 16
+const int PX = 16;            // pixels per subgroup == the tile's N dimension
+const int TILE = 16;
+const int EPL = (FS + SGSIZE - 1) / SGSIZE;
+const int MTILES = (2 * NNS) / TILE;   // 8 neurons per tile, S and E paired
+const int KTILES = FS / TILE;
+
+// Neuron tiles staged per shared round trip. Batching looks like the obvious
+// win -- it amortises the store and both barriers over more multiply-adds -- but
+// it measures slower at every size tried: at nsize=3 the chain costs 56.5
+// ms/frame at BATCH=1, 61.7 at 2 and 73.6 at 4. Each tile in flight is a 16x16
+// fp32 accumulator, about 32 VGPRs per lane, so the added register pressure
+// costs more occupancy than the saved barriers ever cost in latency. Left at 1
+// deliberately: raising it is a measured regression, not an untried idea.
+const int BATCH = 1;
+// Lanes cooperating on one pixel's reduction. The subgroup is wider than PX, so
+// the extra lanes take a stride of rows each and their partials are folded
+// together once at the end rather than being left idle.
+const int LPP = SGSIZE / PX;
+
+// [quality][2*neuron + (0 softmax | 1 elliott)][element], fp16.
+layout(binding = 3, scalar) readonly restrict buffer PdWeights { float16_t pdW[]; };
+
+// Per quality q: NNS vec2 biases (softmax, elliott), then NNS vec2 row sums that
+// predict.comp's fp16 path needs and this one does not.
+layout(binding = 4, scalar) readonly restrict buffer PdBias { vec2 pdB[]; };
+
+layout(binding = 5, scalar) readonly restrict buffer ListBuf { uint listBuf[]; };
+layout(binding = 6, scalar) readonly restrict buffer CountBuf {
+    uint predCount;
+    uint groupsX;
+    uint groupsY;
+    uint groupsZ;
+};
+
+// The B operand: window elements down, pixels across, so a tile is a row major
+// load with stride PX. One block per subgroup.
+shared float16_t shIn[SUBGROUPS * FS * PX];
+// Where a neuron tile's activations land on the way out of the matrix units.
+shared float shAct[SUBGROUPS * BATCH * TILE * PX];
+
+void main() {
+    const uint firstPix = (gl_WorkGroupID.x * uint(SUBGROUPS) + gl_SubgroupID) * uint(PX);
+    const uint npix = USE_LIST ? predCount : uint(pc.width * pc.rows);
+    if (firstPix >= npix)
+        return;
+    const int npx = int(min(uint(PX), npix - firstPix));
+
+    const int lane = int(gl_SubgroupInvocationID);
+    const int shBase = int(gl_SubgroupID) * FS * PX;
+    const int actBase = int(gl_SubgroupID) * BATCH * TILE * PX;
+    const int myPx = lane % PX;          // pixel this lane reduces
+    const int myRow0 = lane / PX;        // its starting row within a batch
+
+    uint idxs[PX];
+    float mstd0[PX], mstd1[PX], mstd2[PX];
+
+    // Gather the windows and stage them pre-scaled. Tail pixels beyond npx
+    // repeat the last valid pixel so every shared slot is written; their results
+    // are simply not stored.
+    [[unroll]] for (int px = 0; px < PX; px++) {
+        const uint li = min(firstPix + uint(px), npix - 1u);
+        const uint idx = USE_LIST ? listBuf[li] : li;
+        idxs[px] = idx;
+
+        const ivec2 org = windowOrigin(idx);
+        const int col0 = org.x, row0 = org.y;
+
+        float v[EPL];
+        float sum = 0.0;
+        [[unroll]] for (int t = 0; t < EPL; t++) {
+            const int e = lane + t * SGSIZE;
+            if (FS % SGSIZE != 0 && e >= FS)
+                continue;
+            v[t] = loadPad(row0 + e / XDIM, col0 + e % XDIM);
+            sum += v[t];
+        }
+        const float mean = subgroupAdd(sum) / float(FS);
+
+        float s2 = 0.0;
+        [[unroll]] for (int t = 0; t < EPL; t++) {
+            const int e = lane + t * SGSIZE;
+            if (FS % SGSIZE != 0 && e >= FS)
+                continue;
+            const float d = v[t] - mean;
+            s2 += d * d;
+        }
+        const float variance = subgroupAdd(s2) / float(FS);
+
+        computeMstd(mean, variance, mstd0[px], mstd1[px], mstd2[px]);
+
+        // Reference scaling: x/std, no centering, because the accumulator is fp32.
+        [[unroll]] for (int t = 0; t < EPL; t++) {
+            const int e = lane + t * SGSIZE;
+            if (FS % SGSIZE != 0 && e >= FS)
+                continue;
+            shIn[shBase + e * PX + px] = float16_t(v[t] * mstd2[px]);
+        }
+    }
+    subgroupMemoryBarrierShared();
+    subgroupBarrier();
+
+    float result = 0.0;   // lane `lane` owns pixel `lane`
+
+    [[unroll]] for (int q = 0; q < QUAL; q++) {
+        const int bBase = q * 2 * NNS;
+        const int wBase = q * 2 * NNS * FS;
+
+        float vsum = 0.0, wsum = 0.0;   // folded across every neuron tile
+
+        for (int mb = 0; mb < MTILES; mb += BATCH) {
+            // BATCH neuron tiles are produced back to back and spilled together, so
+            // the barriers are paid once per batch instead of once per tile.
+            [[unroll]] for (int b = 0; b < BATCH; b++) {
+                const int m = mb + b;
+                coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> acc =
+                    coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(0.0);
+
+                for (int k = 0; k < KTILES; k++) {
+                    coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseA> w;
+                    coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseB> x;
+
+                    // A: [2*neuron + s/e][element], row major, stride FS.
+                    coopMatLoad(w, pdW, uint(wBase + m * TILE * FS + k * TILE), uint(FS),
+                                gl_CooperativeMatrixLayoutRowMajor);
+                    // B: [element][pixel], row major, stride PX.
+                    coopMatLoad(x, shIn, uint(shBase + k * TILE * PX), uint(PX),
+                                gl_CooperativeMatrixLayoutRowMajor);
+
+                    acc = coopMatMulAdd(w, x, acc);
+                }
+                coopMatStore(acc, shAct, uint(actBase + b * TILE * PX), uint(PX),
+                             gl_CooperativeMatrixLayoutRowMajor);
+            }
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+
+            // Every lane reduces: lane l takes pixel l%PX and every LPP'th neuron
+            // row, so a 32 wide subgroup runs two lanes per pixel instead of
+            // leaving half of them idle. Rows 2r and 2r+1 are one neuron's softmax
+            // and elliott activation, which is why the row stride steps in pairs.
+            [[unroll]] for (int b = 0; b < BATCH; b++) {
+                const int tileBase = actBase + b * TILE * PX;
+                const int neuron0 = (mb + b) * (TILE / 2);
+                for (int r = myRow0; r < TILE / 2; r += LPP) {
+                    const vec2 bias = pdB[bBase + neuron0 + r];
+                    const float actS = shAct[tileBase + (2 * r) * PX + myPx] + bias.x;
+                    const float actE = shAct[tileBase + (2 * r + 1) * PX + myPx] + bias.y;
+                    wae5Accum(actS, actE, vsum, wsum);
+                }
+            }
+            subgroupBarrier();   // readers done before the next batch overwrites
+        }
+
+        // Fold the LPP partial reductions for each pixel together.
+        [[unroll]] for (int o = PX; o < SGSIZE; o <<= 1) {
+            vsum += subgroupShuffleXor(vsum, uint(o));
+            wsum += subgroupShuffleXor(wsum, uint(o));
+        }
+        if (lane < PX)
+            result += wae5Blend(vsum, wsum, mstd0[lane], mstd1[lane]);
+    }
+
+    if (lane < npx)
+        storeDst(idxs[lane], result / float(QUAL));
+}
