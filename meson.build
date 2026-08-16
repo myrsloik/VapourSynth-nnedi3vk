@@ -27,10 +27,6 @@ shaders = custom_target(
         'src/shaders/pad.comp',
         'src/shaders/prescreen.comp',
         'src/shaders/predict.comp',
-        # The cooperative matrix predict variant, selected at runtime in place of the fp16
-        # kernel when the device advertises the tile it is written against; see the shape probe
-        # in nnedi3vk.cpp.
-        'src/shaders/predict_cm.comp',
         'src/shaders/rowcopy.comp',
     ),
     output: 'shadersources.h',

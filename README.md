@@ -13,7 +13,7 @@ VapourSynth R73+ with GPU support (API 4.3), and a Vulkan 1.4 capable GPU and dr
 ## Usage
 
 ```py
-nnedi3vk.NNEDI3(vnode:gpu clip, int field[, bint dh=False, int[] planes=[0, 1, 2], int nsize=6, int nns=1, int qual=1, int etype=0, int pscrn=2, bint coop_mat])
+nnedi3vk.NNEDI3(vnode:gpu clip, int field[, bint dh=False, int[] planes=[0, 1, 2], int nsize=6, int nns=1, int qual=1, int etype=0, int pscrn=2])
 ```
 
 - clip: Clip to process. Any format with either 8-16 bit integer or 16/32 bit float is supported.
@@ -56,10 +56,6 @@ nnedi3vk.NNEDI3(vnode:gpu clip, int field[, bint dh=False, int[] planes=[0, 1, 2
   - 2 = new prescreener level 0
   - 3 = new prescreener level 1
   - 4 = new prescreener level 2
-
-- coop_mat: Whether the predictor GEMM runs on cooperative matrix instructions (`VK_KHR_cooperative_matrix`) instead of the subgroup FMA kernel. Left unset it is chosen automatically: used when the core enabled the extension, the device advertises a 16x16x16 fp16->fp32 cooperative matrix at subgroup scope, and the clip is half float. Set True to require it -- an error is raised, naming the reason, if any of those does not hold. Set False to always use the subgroup FMA kernel.
-
-  **Worth setting explicitly.** A device advertising the extension does not necessarily have matrix hardware: on RDNA2 (for example an RX 6900 XT) the driver emulates it on the ordinary vector ALU, and the automatic choice is then a slowdown of roughly 6-31% depending on `nsize`. The cooperative matrix tile pins the kernel to 16 pixels per subgroup where the FMA kernel picks 4, so it stages four times the shared memory and loses occupancy; with no matrix units to pay for that, it cannot win. Accuracy is very slightly better on the matrix path (fp32 accumulate from uncentered inputs, against fp16 accumulate with a centering correction), but the difference is far below the noise of the network itself.
 
 Removed relative to the standalone (pre-GPU-node) versions: `device_index` and `list_device` (device selection is core-wide now), `coopvec` (the core device enables no vendor extensions; the FP32 subgroup GEMV path is used on all hardware), and `num_streams` (the core's execution pool sizes the in-flight bound from its worker threads and budgets the pinned memory itself).
 
